@@ -1,0 +1,10 @@
+name: codex-neutral
+version: "1.0"
+description: Neutral Codex coding seat for interchangeable roles
+
+defaults:
+  runtime: codex
+
+profiles:
+  default:
+    uses: {}

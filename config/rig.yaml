@@ -1,0 +1,14 @@
+version: "0.2"
+name: interchangeable-coding
+summary: >
+  OpenRig persistent multi-agent team where Codex receives dynamic roles per task.
+
+pods:
+  - id: engineering
+    label: Interchangeable Coding Engines
+    members:
+      - id: codex-1
+        agent_ref: local:agents/codex-neutral
+        runtime: codex
+        profile: default
+        cwd: .worktrees/codex-1
