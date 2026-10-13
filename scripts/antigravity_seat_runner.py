@@ -67,6 +67,7 @@ class AntigravitySession:
         self.cwd = cwd
         self.proc: Optional[subprocess.Popen[str]] = None
         self.conversation_id: Optional[str] = None
+        self._unread_line: Optional[str] = None
         self._start_process()
 
     def _start_process(self) -> None:
@@ -104,12 +105,20 @@ class AntigravitySession:
                 except Exception:
                     pass
         self.proc = None
+        self._unread_line = None
 
     def restart(self) -> None:
         self.kill()
         self._start_process()
 
+    def unread_line(self, line: str) -> None:
+        self._unread_line = line
+
     def read_line(self, timeout_sec: float) -> Optional[str]:
+        if self._unread_line is not None:
+            line = self._unread_line
+            self._unread_line = None
+            return line
         if not self.proc or self.proc.stdout is None:
             return None
         deadline = time.time() + timeout_sec
@@ -262,34 +271,25 @@ class AntigravitySession:
                     )
 
                     if step_data.get("state") == "DONE" and step_data.get("step_type") == "agent_response":
-                        emit_bridge_event(
-                            "task_result",
-                            task_id,
-                            role,
-                            "SUCCESS",
-                            attempt=attempt,
-                            exit_code=0,
-                            extra_data={
-                                "response": resp_text,
-                                "duration_seconds": step_data.get("duration_seconds", 0),
-                                "usage": step_data.get("usage", {}),
-                            },
-                        )
-                        return
-                    elif step_data.get("state") == "ERROR":
-                        emit_bridge_event(
-                            "task_result",
-                            task_id,
-                            role,
-                            "ERROR",
-                            attempt=attempt,
-                            exit_code=1,
-                            extra_data={
-                                "response": resp_text,
-                                "error": step_data.get("error", "Step error"),
-                            },
-                        )
-                        return
+                        # Check if a follow-up step (e.g. tool execution) is immediately dispatched
+                        next_line = self.read_line(timeout_sec=0.8)
+                        if next_line is None:
+                            emit_bridge_event(
+                                "task_result",
+                                task_id,
+                                role,
+                                "SUCCESS",
+                                attempt=attempt,
+                                exit_code=0,
+                                extra_data={
+                                    "response": resp_text,
+                                    "duration_seconds": step_data.get("duration_seconds", 0),
+                                    "usage": step_data.get("usage", {}),
+                                },
+                            )
+                            return
+                        else:
+                            self.unread_line(next_line)
 
                 elif provider_event == "result":
                     res_data = event_obj.get("result", {})

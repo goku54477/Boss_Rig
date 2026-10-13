@@ -102,6 +102,21 @@ class OpenCodeBridgeProcess:
             except Exception:
                 self.proc.kill()
                 self.proc.wait(timeout=2)
+        if self.proc.stdin:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+        if self.proc.stdout:
+            try:
+                self.proc.stdout.close()
+            except Exception:
+                pass
+        if self.proc.stderr:
+            try:
+                self.proc.stderr.close()
+            except Exception:
+                pass
 
 
 class TestOpenCodeBridge(unittest.TestCase):
@@ -175,17 +190,19 @@ class TestOpenCodeBridge(unittest.TestCase):
 
     def test_04_real_file_modification_and_state_safety(self) -> None:
         """Requirements 2, 8, 9, 10: File write in worktree, commit recorded, not marked DONE automatically."""
-        task_id = "T-OC-WRITE-01"
+        import time
+        task_id = f"T-OC-WRITE-{int(time.time())}"
         # Assign seat to task branch via worktree gate
         assign_res = run_gate("assign", task_id, "opencode-1")
         self.assertEqual(assign_res.returncode, 0, f"assign failed: {assign_res.stderr}")
 
+        proof_name = f"oc_proof_{task_id}.txt"
         bridge = OpenCodeBridgeProcess()
         try:
             envelope = {
                 "task_id": task_id,
                 "role": "implementer",
-                "goal": "Write the text 'opencode proof' into a file named oc_proof.txt in the current directory and finish.",
+                "goal": f"Write the text 'opencode proof' into a file named {proof_name} in the current directory and finish.",
                 "timeout_sec": 60,
             }
             bridge.send_line(json.dumps(envelope))
@@ -197,19 +214,19 @@ class TestOpenCodeBridge(unittest.TestCase):
             self.assertEqual(result_evt.get("status"), "SUCCESS")
 
             # Invariant: Verify file exists inside seat worktree
-            proof_file = SEAT_WT / "oc_proof.txt"
-            self.assertTrue(proof_file.exists(), "oc_proof.txt was not created")
+            proof_file = SEAT_WT / proof_name
+            self.assertTrue(proof_file.exists(), f"{proof_name} was not created")
 
             # Commit the change in the seat worktree
-            subprocess.run(["git", "add", "oc_proof.txt"], cwd=SEAT_WT, check=True)
-            subprocess.run(["git", "commit", "-m", "test: add oc_proof.txt"], cwd=SEAT_WT, check=True)
+            subprocess.run(["git", "add", proof_name], cwd=SEAT_WT, check=True)
+            subprocess.run(["git", "commit", "-m", f"test: add {proof_name}"], cwd=SEAT_WT, check=True)
 
             # Invariant: State must be ACTIVE, NOT DONE (Agent success != Software DONE)
             status_res = run_gate("status", task_id)
             self.assertEqual(status_res.stdout.strip(), "ACTIVE")
 
             # Deterministic Gate review transitions to DONE
-            review_res = run_gate("review", task_id, "opencode-1", "test -f oc_proof.txt")
+            review_res = run_gate("review", task_id, "opencode-1", f"test -f {proof_name}")
             self.assertEqual(review_res.returncode, 0, f"review failed: {review_res.stderr}")
 
             status_done = run_gate("status", task_id)

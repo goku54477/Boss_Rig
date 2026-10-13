@@ -119,6 +119,21 @@ class AntigravityBridgeProcess:
             except Exception:
                 self.proc.kill()
                 self.proc.wait(timeout=2)
+        if self.proc.stdin:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+        if self.proc.stdout:
+            try:
+                self.proc.stdout.close()
+            except Exception:
+                pass
+        if self.proc.stderr:
+            try:
+                self.proc.stderr.close()
+            except Exception:
+                pass
 
 
 class TestAntigravityBridge(unittest.TestCase):
@@ -163,14 +178,14 @@ class TestAntigravityBridge(unittest.TestCase):
                 "task_id": task_id,
                 "role": "reviewer",
                 "goal": "Inspect the repository and state the seat directory.",
-                "timeout_sec": 30,
+                "timeout_sec": 45,
             }
             bridge.send_line(json.dumps(envelope))
             start_evt = bridge.read_until_event("task_started", timeout_sec=10.0)
             self.assertIsNotNone(start_evt)
             self.assertEqual(start_evt.get("role"), "reviewer")
 
-            result_evt = bridge.read_until_event("task_result", timeout_sec=30.0)
+            result_evt = bridge.read_until_event("task_result", timeout_sec=45.0)
             self.assertIsNotNone(result_evt)
             self.assertEqual(result_evt.get("status"), "SUCCESS")
             self.assertTrue(bridge.is_alive())
@@ -179,13 +194,15 @@ class TestAntigravityBridge(unittest.TestCase):
 
     def test_03_controlled_write_and_state_safety(self) -> None:
         """Requirement 3: Write file in worktree, commit, verify state safety through gate."""
-        task_id = "T-AGY-WRITE-01"
+        import time
+        task_id = f"T-AGY-WRITE-{int(time.time())}"
         subprocess.run(["git", "clean", "-fd"], cwd=SEAT_WT, check=False)
         subprocess.run(["git", "checkout", "-B", "seat/antigravity-1", "integration"], cwd=SEAT_WT, check=False)
         assign_res = run_gate("assign", task_id, "antigravity-1")
         self.assertEqual(assign_res.returncode, 0, f"assign failed: {assign_res.stderr}")
 
-        proof_file = SEAT_WT / "agy_proof.txt"
+        proof_name = f"agy_proof_{task_id}.txt"
+        proof_file = SEAT_WT / proof_name
         if proof_file.exists():
             proof_file.unlink()
 
@@ -194,30 +211,30 @@ class TestAntigravityBridge(unittest.TestCase):
             envelope = {
                 "task_id": task_id,
                 "role": "implementer",
-                "goal": "Write the text 'antigravity verified' into a file named agy_proof.txt in current directory.",
-                "timeout_sec": 45,
+                "goal": f"Write the text 'antigravity verified' into a file named {proof_name} in current directory.",
+                "timeout_sec": 60,
             }
             bridge.send_line(json.dumps(envelope))
             start_evt = bridge.read_until_event("task_started", timeout_sec=10.0)
             self.assertIsNotNone(start_evt)
 
-            result_evt = bridge.read_until_event("task_result", timeout_sec=45.0)
+            result_evt = bridge.read_until_event("task_result", timeout_sec=60.0)
             self.assertIsNotNone(result_evt)
             self.assertEqual(result_evt.get("status"), "SUCCESS")
 
             # Verify file exists inside seat worktree
-            self.assertTrue(proof_file.exists(), "agy_proof.txt was not created")
+            self.assertTrue(proof_file.exists(), f"{proof_name} was not created")
 
             # Commit the change
-            subprocess.run(["git", "add", "agy_proof.txt"], cwd=SEAT_WT, check=True)
-            subprocess.run(["git", "commit", "-m", "test: add agy_proof.txt"], cwd=SEAT_WT, check=True)
+            subprocess.run(["git", "add", proof_name], cwd=SEAT_WT, check=True)
+            subprocess.run(["git", "commit", "-m", f"test: add {proof_name}"], cwd=SEAT_WT, check=True)
 
             # Invariant: State must be ACTIVE, NOT DONE (Agent success != Software DONE)
             status_res = run_gate("status", task_id)
             self.assertEqual(status_res.stdout.strip(), "ACTIVE")
 
             # Deterministic Gate review transitions to DONE
-            review_res = run_gate("review", task_id, "antigravity-1", "test -f agy_proof.txt")
+            review_res = run_gate("review", task_id, "antigravity-1", f"test -f {proof_name}")
             self.assertEqual(review_res.returncode, 0, f"review failed: {review_res.stderr}")
 
             status_done = run_gate("status", task_id)

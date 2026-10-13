@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.worktrees/
+.openrig-bridge/
+*.log
+.coverage

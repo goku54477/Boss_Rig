@@ -385,6 +385,21 @@ case "$cmd" in
     recover "${1:-}"
     ;;
 
+  reset-seat)
+    [[ $# -eq 1 ]] || usage
+    seat="$1"
+    safe_id "$seat"
+    wt="$WORKTREE_ROOT/$seat"
+    parking="seat/$seat"
+
+    git -C "$wt" reset --hard HEAD >/dev/null 2>&1 || true
+    git -C "$wt" clean -fd >/dev/null 2>&1 || true
+    git -C "$wt" switch "$parking" >/dev/null 2>&1 || git -C "$wt" checkout -B "$parking" "$INTEGRATION_BRANCH" >/dev/null 2>&1
+    git -C "$wt" reset --hard "$INTEGRATION_BRANCH" >/dev/null 2>&1
+    normalize_worktree_gitdir "$wt" "$seat"
+    echo "reset seat $seat back to $parking"
+    ;;
+
   *)
     usage
     ;;
