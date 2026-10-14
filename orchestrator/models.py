@@ -17,6 +17,8 @@ class TaskState(str, enum.Enum):
     MERGE_READY = "MERGE_READY"
     MERGING = "MERGING"
     DONE = "DONE"
+    BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
 
 
 KNOWN_ENGINES = ("codex-1", "opencode-1", "antigravity-1")
@@ -50,6 +52,7 @@ class TaskEnvelope:
     max_attempts: int = 2
     timeout_sec: int = 1800
     candidate_commit: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = {
@@ -65,6 +68,8 @@ class TaskEnvelope:
         }
         if self.candidate_commit:
             data["candidate_commit"] = self.candidate_commit
+        if self.context:
+            data["context"] = self.context
         return data
 
 

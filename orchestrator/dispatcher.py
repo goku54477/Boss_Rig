@@ -144,8 +144,7 @@ class TaskDispatcher:
         elif engine == "antigravity-1":
             bridge = SeatBridgeProcess(engine, "antigravity-seat-runner.sh", seat_wt)
         elif engine == "codex-1":
-            # For testing and execution under OpenRig, we also provide a bridge adapter
-            bridge = SeatBridgeProcess(engine, "opencode-seat-runner.sh", seat_wt)
+            bridge = SeatBridgeProcess(engine, "codex-seat-runner.sh", seat_wt)
         else:
             raise ValueError(f"Unknown engine: {engine}")
 

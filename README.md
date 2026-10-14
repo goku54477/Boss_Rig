@@ -301,5 +301,49 @@ Bridges stream structured events back to the supervisor:
 
 ---
 
+## 🛠️ Boss Rig Operator CLI & Daily Operations
+
+Boss Rig provides a production CLI for controlling the orchestrator and inspecting seat state:
+
+```bash
+# 1. Bootstrap environment and seats
+./scripts/bootstrap.sh
+
+# 2. Inspect active seats, branches, and task summary
+./scripts/boss-orchestrator status
+
+# 3. Run an autonomous feature workflow
+./scripts/boss-orchestrator run "Implement string utility" \
+  --verify "python3 -c 'import string_util; assert string_util.clean(\" A \") == \"A\"'" \
+  --planner antigravity-1 \
+  --implementer opencode-1 \
+  --reviewer codex-1
+
+# 4. Show task record, transitions, and audit provenance
+./scripts/boss-orchestrator task show <task_id>
+
+# 5. Pause, resume, or cancel tasks
+./scripts/boss-orchestrator pause <task_id>
+./scripts/boss-orchestrator resume <task_id>
+./scripts/boss-orchestrator stop <task_id>
+
+# 6. Reclaim stale locks and recover crashed seats
+./scripts/boss-orchestrator recover --force
+```
+
+For detailed daily operational walkthroughs, see the **[Operator Guide](docs/OPERATOR_GUIDE.md)**.
+
+---
+
+## 📊 Live Verification Reports & Evidence
+
+All multi-agent capabilities are proven against real models in isolated Git worktrees:
+
+- **[Live 3×3 Interchangeability Matrix Report](docs/LIVE_INTERCHANGEABILITY_REPORT.md)**: Proves `ENGINE != ROLE` across all 9 combinations of `codex-1`, `opencode-1`, and `antigravity-1` in `planner`, `implementer`, and `reviewer` roles.
+- **[Live Role-Rotated End-to-End Workflow Report](docs/LIVE_E2E_REPORT.md)**: Documents Workflows A, B, and C with full candidate commit pinning, independent review enforcement, and deterministic gate pass.
+- **[Live Concurrency & Lock Contention Report](docs/LIVE_CONCURRENCY_REPORT.md)**: Proves 3-way simultaneous task execution, atomic merge lock contention, and automatic integration revalidation.
+
+---
+
 ## 📄 License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

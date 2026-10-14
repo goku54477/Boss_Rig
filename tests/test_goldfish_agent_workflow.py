@@ -24,7 +24,24 @@ sys.path.insert(0, str(REPO_ROOT))
 from orchestrator.engine import OrchestrationEngine, run_gate
 from orchestrator.models import TaskRecord, TaskState
 
-GOLDFISH_DB_PATH = Path(os.environ.get("APPDATA", r"C:\Users\jacob\AppData\Roaming")) / "goldfish" / "goldfish.db"
+def _resolve_goldfish_db() -> Path:
+    if "GOLDFISH_DB_PATH" in os.environ:
+        return Path(os.environ["GOLDFISH_DB_PATH"])
+    # In WSL, dynamically locate user AppData
+    mnt_users = Path("/mnt/c/Users")
+    if mnt_users.exists():
+        for user_dir in mnt_users.glob("*"):
+            candidate = user_dir / "AppData" / "Roaming" / "goldfish" / "goldfish.db"
+            if candidate.exists():
+                return candidate
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        p = Path(appdata) / "goldfish" / "goldfish.db"
+        if p.exists():
+            return p
+    return Path.home() / ".goldfish" / "goldfish.db"
+
+GOLDFISH_DB_PATH = _resolve_goldfish_db()
 
 
 class TestGoldfishAgentWorkflow(unittest.TestCase):

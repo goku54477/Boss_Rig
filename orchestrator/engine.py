@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from orchestrator.dispatcher import TaskDispatcher
 from orchestrator.models import TaskEnvelope, TaskRecord, TaskState
 from orchestrator.policy import PolicyEngine, PolicyViolation
+from orchestrator.store import TaskStore
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GATE_SCRIPT = REPO_ROOT / "scripts" / "worktree-gate.sh"
@@ -27,7 +28,12 @@ def run_gate(*args: str) -> subprocess.CompletedProcess[str]:
 class OrchestrationEngine:
     """Production coordination supervisor managing multi-agent tasks."""
 
-    def __init__(self, dispatcher: Optional[TaskDispatcher] = None):
+    def __init__(
+        self,
+        dispatcher: Optional[TaskDispatcher] = None,
+        store: Optional[TaskStore] = None,
+    ):
+        self.store = store or TaskStore()
         self.tasks: Dict[str, TaskRecord] = {}
         self.dispatcher = dispatcher or TaskDispatcher()
 
@@ -41,6 +47,11 @@ class OrchestrationEngine:
         if task_id in self.tasks:
             return self.tasks[task_id]
 
+        existing = self.store.get_task(task_id)
+        if existing:
+            self.tasks[task_id] = existing
+            return existing
+
         record = TaskRecord(
             task_id=task_id,
             state=TaskState.QUEUED,
@@ -49,6 +60,7 @@ class OrchestrationEngine:
         )
         record.transition(TaskState.QUEUED, reason="Task created")
         self.tasks[task_id] = record
+        self.store.save_task(record)
         return record
 
     def assign_role(self, task_id: str, engine: str, role: str) -> TaskRecord:
@@ -67,6 +79,7 @@ class OrchestrationEngine:
         task.assigned_engine = engine
         task.assigned_role = role
         task.transition(TaskState.ASSIGNED, reason=f"Assigned {engine} as {role}")
+        self.store.save_task(task)
         return task
 
     def execute_turn(
@@ -132,6 +145,8 @@ class OrchestrationEngine:
                 error=event.get("error", "Execution failure"),
             )
 
+        self.store.record_event(event)
+        self.store.save_task(task)
         return event
 
     def run_deterministic_verification(
@@ -172,12 +187,14 @@ class OrchestrationEngine:
 
             # Release seat
             run_gate("release", task_id, seat)
+            self.store.save_task(task)
             return True
         else:
             task.transition(
                 TaskState.REVIEW_FAILED,
                 reason=f"Verification gate failed: {gate_res.stderr}",
             )
+            self.store.save_task(task)
             return False
 
     def close(self) -> None:

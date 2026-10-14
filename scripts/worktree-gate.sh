@@ -133,14 +133,24 @@ run_checks() {
 }
 
 acquire_lock() {
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
-    printf '%s\n' "$$" > "$LOCK_DIR/pid"
-    printf '%s\n' "$HOST" > "$LOCK_DIR/host"
-    date +%s > "$LOCK_DIR/started"
-    return 0
-  fi
+  local timeout="${1:-${OPENRIG_LOCK_TIMEOUT_SEC:-30}}"
+  local deadline=$(( $(date +%s) + timeout ))
 
-  echo "merge lock already exists: $LOCK_DIR" >&2
+  while true; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_DIR/pid"
+      printf '%s\n' "$HOST" > "$LOCK_DIR/host"
+      date +%s > "$LOCK_DIR/started"
+      return 0
+    fi
+
+    if [[ $(date +%s) -ge $deadline ]]; then
+      break
+    fi
+    sleep 0.2
+  done
+
+  echo "merge lock already exists (timed out after ${timeout}s): $LOCK_DIR" >&2
   return 75
 }
 

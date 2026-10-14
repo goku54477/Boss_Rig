@@ -1,0 +1,56 @@
+name: Boss Rig CI
+
+on:
+  push:
+    branches: [ main, integration ]
+  pull_request:
+    branches: [ main, integration ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "Boss Rig CI"
+          git config --global user.email "ci@boss-rig.local"
+          git checkout -B main
+          git branch -f integration HEAD
+
+      - name: Run Core Test Suite
+        run: |
+          # 1. Antigravity safe permissions and completion semantics
+          python3 -m unittest tests/test_antigravity_completion_semantics.py
+          
+          # 2. Codex bridge safe sandboxing
+          python3 -m unittest tests/test_codex_bridge.py
+          
+          # 3. Dynamic Scheduler and Policy Enforcement
+          python3 -m unittest tests/test_scheduler_and_policy.py
+          
+          # 4. Worktree supervisor and merge gate
+          python3 -m unittest tests/test_worktree_gate.py
+          
+          # 5. SQLite Task Store and Idempotency
+          python3 -m unittest tests/test_store_and_idempotency.py
+          
+          # 6. Fault injection and recovery
+          python3 -m unittest tests/test_fault_injection.py
+
+      - name: Run Concurrency Gate Contention Test
+        run: |
+          python3 -m unittest tests/test_concurrency_proof.py
