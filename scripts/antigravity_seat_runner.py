@@ -199,7 +199,12 @@ class AntigravitySession:
             return
 
         start_time = time.time()
+        last_event_time = time.time()
         resp_text = ""
+        agent_response_done = False
+        last_step_data = {}
+        drain_timeout_sec = float(os.environ.get("ANTIGRAVITY_DRAIN_TIMEOUT_SEC", "1.5"))
+
         with open(LOG_PATH, "a", encoding="utf-8") as log_file:
             while True:
                 elapsed = time.time() - start_time
@@ -218,7 +223,7 @@ class AntigravitySession:
                     )
                     return
 
-                line = self.read_line(timeout_sec=remaining)
+                line = self.read_line(timeout_sec=min(remaining, 1.0))
                 if line is None:
                     if not self.is_alive():
                         # Child died unexpectedly
@@ -233,7 +238,27 @@ class AntigravitySession:
                         )
                         self.restart()
                         return
+
+                    # Fallback drain completion: If agent_response finished and stream has been silent past drain timeout
+                    if agent_response_done and (time.time() - last_event_time) >= drain_timeout_sec:
+                        emit_bridge_event(
+                            "task_result",
+                            task_id,
+                            role,
+                            "SUCCESS",
+                            attempt=attempt,
+                            exit_code=0,
+                            extra_data={
+                                "response": resp_text,
+                                "duration_seconds": last_step_data.get("duration_seconds", 0),
+                                "usage": last_step_data.get("usage", {}),
+                                "completion_fallback": "drain_timeout",
+                            },
+                        )
+                        return
                     continue
+
+                last_event_time = time.time()
 
                 log_file.write(line + "\n")
                 log_file.flush()
@@ -280,30 +305,14 @@ class AntigravitySession:
                     )
 
                     if step_data.get("state") == "DONE" and step_data.get("step_type") == "agent_response":
-                        # Peek ahead with 2.0s window to consume follow-up tool execution or result event
-                        next_line = self.read_line(timeout_sec=2.0)
-                        if next_line is not None:
-                            self.unread_line(next_line)
-                        else:
-                            emit_bridge_event(
-                                "task_result",
-                                task_id,
-                                role,
-                                "SUCCESS",
-                                attempt=attempt,
-                                exit_code=0,
-                                extra_data={
-                                    "response": resp_text,
-                                    "duration_seconds": step_data.get("duration_seconds", 0),
-                                    "usage": step_data.get("usage", {}),
-                                },
-                            )
-                            return
+                        agent_response_done = True
+                        last_step_data = step_data
 
                 elif provider_event == "result":
+                    # Authoritative terminal event in Antigravity stream protocol
                     res_data = event_obj.get("result", {})
                     status_str = res_data.get("status", "SUCCESS")
-                    resp_text = res_data.get("response", "")
+                    final_resp = res_data.get("response") or resp_text
                     duration = res_data.get("duration_seconds", 0)
                     emit_bridge_event(
                         "task_result",
@@ -313,7 +322,7 @@ class AntigravitySession:
                         attempt=attempt,
                         exit_code=0 if status_str == "SUCCESS" else 1,
                         extra_data={
-                            "response": resp_text,
+                            "response": final_resp,
                             "duration_seconds": duration,
                             "usage": res_data.get("usage", {}),
                         },

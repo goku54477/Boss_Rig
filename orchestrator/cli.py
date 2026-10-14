@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from orchestrator.engine import OrchestrationEngine, run_gate
-from orchestrator.models import KNOWN_ENGINES, TaskRecord, TaskState
+from orchestrator.models import KNOWN_ENGINES, SeatMode, TaskRecord, TaskState
 from orchestrator.store import TaskStore
 
 
@@ -76,7 +76,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("\n[Active Seats]")
     for seat in KNOWN_ENGINES:
         branch = get_seat_branch(seat)
-        print(f"  • {seat:15} | Branch: {branch:25} | Runtime: {seat.split('-')[0]}")
+        mode_info = store.get_seat_mode(seat)
+        mode_str = mode_info["mode"].value
+        if mode_info["mode"] == SeatMode.MANUAL_HOLD:
+            mode_str += f" (HELD: {mode_info['reason']})"
+        print(f"  • {seat:15} | Branch: {branch:22} | Mode: {mode_str:25} | Runtime: {seat.split('-')[0]}")
 
     # Merge Lock
     lock_path = REPO_ROOT / ".git" / "openrig-merge.lock"
@@ -236,6 +240,59 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_seat_hold(args: argparse.Namespace) -> int:
+    store = TaskStore()
+    if args.seat_id not in KNOWN_ENGINES:
+        print(f"❌ Unknown seat: {args.seat_id}. Must be one of {KNOWN_ENGINES}")
+        return 1
+    info = store.set_seat_mode(
+        args.seat_id,
+        SeatMode.MANUAL_HOLD,
+        reason=args.reason or "Manual operator hold",
+        held_by=os.environ.get("USER", "operator"),
+    )
+    print(f"🛑 Seat '{args.seat_id}' is now on MANUAL_HOLD.")
+    print(f"   Reason: {info['reason']}")
+    print(f"   Automated dispatch to this seat is blocked until released.")
+    return 0
+
+
+def cmd_seat_release(args: argparse.Namespace) -> int:
+    store = TaskStore()
+    if args.seat_id not in KNOWN_ENGINES:
+        print(f"❌ Unknown seat: {args.seat_id}. Must be one of {KNOWN_ENGINES}")
+        return 1
+    info = store.set_seat_mode(
+        args.seat_id,
+        SeatMode.AUTOMATED,
+        reason="Released by operator",
+        held_by=os.environ.get("USER", "operator"),
+    )
+    print(f"✅ Seat '{args.seat_id}' released back to AUTOMATED mode.")
+    return 0
+
+
+def cmd_seat_status(args: argparse.Namespace) -> int:
+    store = TaskStore()
+    print("═══════════════════════════════════════════════════════════════")
+    print("                     SEAT OPERATIONAL MODES                    ")
+    print("═══════════════════════════════════════════════════════════════")
+    for seat in KNOWN_ENGINES:
+        info = store.get_seat_mode(seat)
+        branch = get_seat_branch(seat)
+        mode = info["mode"].value
+        reason = info["reason"]
+        held_by = info["held_by"]
+        print(f"Seat: {seat}")
+        print(f"  Branch:  {branch}")
+        print(f"  Mode:    {mode}")
+        if info["mode"] == SeatMode.MANUAL_HOLD:
+            print(f"  Reason:  {reason}")
+            print(f"  Held by: {held_by}")
+        print()
+    return 0
+
+
 def cmd_recover(args: argparse.Namespace) -> int:
     print("🔧 Running deterministic recovery...")
     res = run_gate("recover", "--force" if args.force else "")
@@ -255,6 +312,19 @@ def main() -> int:
 
     # status
     subparsers.add_parser("status", help="Show system, seat, and task status")
+
+    # seat
+    p_seat = subparsers.add_parser("seat", help="Operator seat controls (hold / release / status)")
+    p_seat_sub = p_seat.add_subparsers(dest="seat_subcommand", required=True)
+    
+    p_seat_hold = p_seat_sub.add_parser("hold", help="Place a seat on manual hold")
+    p_seat_hold.add_argument("seat_id", help="Seat ID (e.g. codex-1, opencode-1, antigravity-1)")
+    p_seat_hold.add_argument("--reason", help="Reason for hold", default="Manual operator hold")
+
+    p_seat_rel = p_seat_sub.add_parser("release", help="Release a seat back to automated scheduling")
+    p_seat_rel.add_argument("seat_id", help="Seat ID to release")
+
+    p_seat_sub.add_parser("status", help="Show seat operational modes")
 
     # task show
     p_show = subparsers.add_parser("task", help="Task management")
@@ -295,6 +365,13 @@ def main() -> int:
         return cmd_up(args)
     elif args.subcommand == "status":
         return cmd_status(args)
+    elif args.subcommand == "seat":
+        if args.seat_subcommand == "hold":
+            return cmd_seat_hold(args)
+        elif args.seat_subcommand == "release":
+            return cmd_seat_release(args)
+        elif args.seat_subcommand == "status":
+            return cmd_seat_status(args)
     elif args.subcommand == "task" and args.task_subcommand == "show":
         return cmd_task_show(args)
     elif args.subcommand == "run":

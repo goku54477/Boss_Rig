@@ -9,10 +9,16 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from orchestrator.models import BridgeEvent, TaskEnvelope
+from orchestrator.models import BridgeEvent, SeatMode, TaskEnvelope
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKTREES_DIR = REPO_ROOT / ".worktrees"
+
+
+class SeatHoldError(RuntimeError):
+    """Raised when dispatch is attempted on a seat currently in MANUAL_HOLD."""
+    pass
+
 
 
 class SeatBridgeProcess:
@@ -128,8 +134,9 @@ class SeatBridgeProcess:
 class TaskDispatcher:
     """Dispatches tasks to the appropriate engine seat."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: Optional[Any] = None) -> None:
         self.active_bridges: Dict[str, SeatBridgeProcess] = {}
+        self.store = store
 
     def get_or_start_bridge(self, engine: str) -> SeatBridgeProcess:
         if engine in self.active_bridges and self.active_bridges[engine].is_alive():
@@ -158,6 +165,14 @@ class TaskDispatcher:
         timeout_sec: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Dispatch task to engine and wait for completion event."""
+        if self.store is not None:
+            mode_info = self.store.get_seat_mode(engine)
+            if mode_info.get("mode") == SeatMode.MANUAL_HOLD:
+                reason = mode_info.get("reason", "Operator hold active")
+                raise SeatHoldError(
+                    f"Seat '{engine}' is on MANUAL_HOLD: {reason}. Automated dispatch rejected."
+                )
+
         timeout = timeout_sec or envelope.timeout_sec
         bridge = self.get_or_start_bridge(engine)
 

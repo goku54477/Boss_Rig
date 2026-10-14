@@ -4,3 +4,24 @@ __pycache__/
 .openrig-bridge/
 *.log
 .coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Credentials and secrets
+.env
+.env.*
+*.env
+auth.json
+auth.toml
+credentials.json
+*.key
+*.pem
+*.p12
+
+# Database files
+*.sqlite
+*.sqlite3
+*.db
+openrig.sqlite
+goldfish.db

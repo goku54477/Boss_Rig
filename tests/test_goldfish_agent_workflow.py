@@ -154,6 +154,10 @@ class TestGoldfishAgentWorkflow(unittest.TestCase):
         int_wt = REPO_ROOT / ".worktrees" / "_integration"
         self.assertTrue((int_wt / spec_content["module"]).exists())
 
+        # Clean up temporary spec file from codex-1 seat
+        if spec_file.exists():
+            spec_file.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

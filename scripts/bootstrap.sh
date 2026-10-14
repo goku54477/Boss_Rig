@@ -7,6 +7,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Ensure all scripts are executable early
+chmod +x "$ROOT"/scripts/*.sh "$ROOT"/scripts/boss-orchestrator 2>/dev/null || true
+
 echo "=================================================================="
 echo "          BOSS RIG — PRODUCTION MULTI-AGENT BOOTSTRAP             "
 echo "=================================================================="

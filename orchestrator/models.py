@@ -21,6 +21,11 @@ class TaskState(str, enum.Enum):
     CANCELLED = "CANCELLED"
 
 
+class SeatMode(str, enum.Enum):
+    AUTOMATED = "AUTOMATED"
+    MANUAL_HOLD = "MANUAL_HOLD"
+
+
 KNOWN_ENGINES = ("codex-1", "opencode-1", "antigravity-1")
 
 KNOWN_ROLES = (

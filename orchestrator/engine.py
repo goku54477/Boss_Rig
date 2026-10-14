@@ -5,8 +5,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from orchestrator.dispatcher import TaskDispatcher
-from orchestrator.models import TaskEnvelope, TaskRecord, TaskState
+from orchestrator.dispatcher import SeatHoldError, TaskDispatcher
+from orchestrator.models import SeatMode, TaskEnvelope, TaskRecord, TaskState
 from orchestrator.policy import PolicyEngine, PolicyViolation
 from orchestrator.store import TaskStore
 
@@ -35,7 +35,9 @@ class OrchestrationEngine:
     ):
         self.store = store or TaskStore()
         self.tasks: Dict[str, TaskRecord] = {}
-        self.dispatcher = dispatcher or TaskDispatcher()
+        self.dispatcher = dispatcher or TaskDispatcher(store=self.store)
+        if self.dispatcher.store is None:
+            self.dispatcher.store = self.store
 
     def create_task(
         self,
@@ -93,6 +95,23 @@ class OrchestrationEngine:
         """Execute a turn with an engine and manage worktree binding."""
         task = self.tasks[task_id]
         PolicyEngine.validate_engine_and_role(engine, role)
+
+        # Invariant: Never dispatch automated work to a seat on MANUAL_HOLD
+        mode_info = self.store.get_seat_mode(engine)
+        if mode_info.get("mode") == SeatMode.MANUAL_HOLD:
+            reason = mode_info.get("reason", "Operator manual hold active")
+            self.store.transition_task(
+                task_id,
+                TaskState.BLOCKED,
+                reason=f"Dispatch rejected: seat {engine} is in MANUAL_HOLD ({reason})",
+            )
+            task.transition(
+                TaskState.BLOCKED,
+                reason=f"Dispatch rejected: seat {engine} is in MANUAL_HOLD ({reason})",
+            )
+            raise SeatHoldError(
+                f"Seat '{engine}' is on MANUAL_HOLD: {reason}. Automated turn rejected."
+            )
 
         # Ensure seat worktree is initialized
         seat_wt = WORKTREES_DIR / engine

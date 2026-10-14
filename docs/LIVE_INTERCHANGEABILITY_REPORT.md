@@ -1,6 +1,6 @@
 # Live 3×3 Agent-Role Interchangeability Matrix Report
 
-**Generated:** 2026-10-14T09:59:23Z  
+**Generated:** 2026-10-14T11:16:17Z  
 **Architecture:** OpenRig single control plane  
 **Principle:** `ENGINE != ROLE` — All engines independently verified in all semantic roles.
 
@@ -8,15 +8,15 @@
 
 | Engine Seat | Role | Status | Latency (s) | Model / Runtime | Contract Evidence |
 | :--- | :--- | :---: | :---: | :--- | :--- |
-| `codex-1` | **planner** | ✅ PASS | 9.45s | `codex` | Clean worktree verified; zero file mutations |
-| `codex-1` | **implementer** | ✅ PASS | 14.60s | `codex` | Candidate commit `e4753659` pinned |
-| `codex-1` | **reviewer** | ✅ PASS | 17.04s | `codex` | Clean worktree; reviewed commit `e4753659` |
-| `opencode-1` | **planner** | ✅ PASS | 6.93s | `opencode` | Clean worktree verified; zero file mutations |
-| `opencode-1` | **implementer** | ✅ PASS | 14.62s | `opencode` | Candidate commit `4325c1fc` pinned |
-| `opencode-1` | **reviewer** | ✅ PASS | 10.55s | `opencode` | Clean worktree; reviewed commit `4325c1fc` |
-| `antigravity-1` | **planner** | ✅ PASS | 20.19s | `antigravity` | Clean worktree verified; zero file mutations |
-| `antigravity-1` | **implementer** | ✅ PASS | 1.53s | `antigravity` | Candidate commit `1df54f54` pinned |
-| `antigravity-1` | **reviewer** | ✅ PASS | 7.01s | `antigravity` | Clean worktree; reviewed commit `1df54f54` |
+| `codex-1` | **planner** | ✅ PASS | 7.61s | `codex` | Clean worktree verified; zero file mutations |
+| `codex-1` | **implementer** | ✅ PASS | 29.39s | `codex` | Candidate commit `aa422ecd` pinned |
+| `codex-1` | **reviewer** | ✅ PASS | 15.01s | `codex` | Clean worktree; reviewed commit `aa422ecd` |
+| `opencode-1` | **planner** | ✅ PASS | 7.54s | `opencode` | Clean worktree verified; zero file mutations |
+| `opencode-1` | **implementer** | ✅ PASS | 27.30s | `opencode` | Candidate commit `d51b14c1` pinned |
+| `opencode-1` | **reviewer** | ✅ PASS | 18.62s | `opencode` | Clean worktree; reviewed commit `d51b14c1` |
+| `antigravity-1` | **planner** | ✅ PASS | 21.10s | `antigravity` | Clean worktree verified; zero file mutations |
+| `antigravity-1` | **implementer** | ✅ PASS | 1.31s | `antigravity` | Candidate commit `09d497b2` pinned |
+| `antigravity-1` | **reviewer** | ✅ PASS | 6.45s | `antigravity` | Clean worktree; reviewed commit `09d497b2` |
 
 ## Contract Verification Details
 

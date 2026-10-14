@@ -23,15 +23,13 @@ def run_gate(*args: str) -> subprocess.CompletedProcess[str]:
 
 def git_cmd(*args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
     cmd = ["git", *args]
-    res = subprocess.run(
+    return subprocess.run(
         cmd,
         cwd=cwd,
         capture_output=True,
         text=True,
+        check=True,
     )
-    if res.returncode != 0:
-        raise RuntimeError(f"git command failed {cmd} in {cwd}: {res.stderr}\nstdout: {res.stdout}")
-    return res
 
 
 class TestWorktreeGate(unittest.TestCase):
@@ -48,7 +46,8 @@ class TestWorktreeGate(unittest.TestCase):
         run_gate("recover", "--force")
         seat_wt = REPO_ROOT / ".worktrees" / "gate-test-1"
         if seat_wt.exists():
-            subprocess.run(["git", "-C", str(seat_wt), "reset", "--hard", "HEAD"], capture_output=True)
+            subprocess.run(["git", "-C", str(seat_wt), "checkout", "seat/gate-test-1"], capture_output=True)
+            subprocess.run(["git", "-C", str(seat_wt), "reset", "--hard", "integration"], capture_output=True)
             subprocess.run(["git", "-C", str(seat_wt), "clean", "-fd"], capture_output=True)
 
     def test_01_init_seat(self) -> None:
@@ -61,11 +60,12 @@ class TestWorktreeGate(unittest.TestCase):
 
     def test_02_assign_task(self) -> None:
         """Invariant: assign switches worktree to transient task branch and marks ACTIVE."""
+        task_id = f"T-GATE-02-{int(time.time()*1000)}"
         run_gate("init-seat", "gate-test-1")
-        res = run_gate("assign", "T-GATE-01", "gate-test-1")
+        res = run_gate("assign", task_id, "gate-test-1")
         self.assertEqual(res.returncode, 0, f"assign failed: {res.stderr}")
 
-        status = run_gate("status", "T-GATE-01")
+        status = run_gate("status", task_id)
         self.assertEqual(status.stdout.strip(), "ACTIVE")
 
         # Verify current branch in worktree
@@ -76,12 +76,13 @@ class TestWorktreeGate(unittest.TestCase):
             text=True,
             check=True,
         ).stdout.strip()
-        self.assertEqual(curr_branch, "task/T-GATE-01")
+        self.assertEqual(curr_branch, f"task/{task_id}")
 
     def test_03_review_and_merge_success(self) -> None:
         """Invariant: passing tests allow merge into integration and mark DONE."""
+        task_id = f"T-GATE-03-{int(time.time()*1000)}"
         run_gate("init-seat", "gate-test-1")
-        run_gate("assign", "T-GATE-03", "gate-test-1")
+        run_gate("assign", task_id, "gate-test-1")
         seat_wt = REPO_ROOT / ".worktrees" / "gate-test-1"
 
         # Create a fresh unique test commit
@@ -92,10 +93,10 @@ class TestWorktreeGate(unittest.TestCase):
         git_cmd("commit", "-m", f"feat: test success file {filename}", cwd=seat_wt)
 
         # Review with passing verification command
-        res = run_gate("review", "T-GATE-03", "gate-test-1", f"test -f {filename}")
+        res = run_gate("review", task_id, "gate-test-1", f"test -f {filename}")
         self.assertEqual(res.returncode, 0, f"review failed: {res.stderr}\nstdout: {res.stdout}")
 
-        status = run_gate("status", "T-GATE-03")
+        status = run_gate("status", task_id)
         self.assertEqual(status.stdout.strip(), "DONE")
 
         # Verify commit landed on integration
@@ -103,13 +104,14 @@ class TestWorktreeGate(unittest.TestCase):
         self.assertTrue((int_wt / filename).exists())
 
         # Release task
-        rel_res = run_gate("release", "T-GATE-03", "gate-test-1")
+        rel_res = run_gate("release", task_id, "gate-test-1")
         self.assertEqual(rel_res.returncode, 0, f"release failed: {rel_res.stderr}")
 
     def test_04_failing_tests_prevent_merge(self) -> None:
         """Invariant: failing tests abort merge, set REVIEW_FAILED, and leave worktree inspectable."""
+        task_id = f"T-GATE-04-{int(time.time()*1000)}"
         run_gate("init-seat", "gate-test-1")
-        run_gate("assign", "T-GATE-FAIL-04", "gate-test-1")
+        run_gate("assign", task_id, "gate-test-1")
         seat_wt = REPO_ROOT / ".worktrees" / "gate-test-1"
 
         filename = f"bad_{int(time.time())}.txt"
@@ -119,10 +121,10 @@ class TestWorktreeGate(unittest.TestCase):
         git_cmd("commit", "-m", f"feat: intentional failure {filename}", cwd=seat_wt)
 
         # Review with failing verification command
-        res = run_gate("review", "T-GATE-FAIL-04", "gate-test-1", "exit 1")
+        res = run_gate("review", task_id, "gate-test-1", "exit 1")
         self.assertNotEqual(res.returncode, 0)
 
-        status = run_gate("status", "T-GATE-FAIL-04")
+        status = run_gate("status", task_id)
         self.assertEqual(status.stdout.strip(), "REVIEW_FAILED")
 
         # Verify worktree remains intact and inspectable
@@ -133,19 +135,20 @@ class TestWorktreeGate(unittest.TestCase):
         self.assertFalse((int_wt / filename).exists())
 
         # Invariant: release MUST refuse when task is not DONE
-        rel_res = run_gate("release", "T-GATE-FAIL-04", "gate-test-1")
+        rel_res = run_gate("release", task_id, "gate-test-1")
         self.assertNotEqual(rel_res.returncode, 0)
         self.assertIn("refusing release: task is not DONE", rel_res.stderr)
 
         # Clean up failed task branch for subsequent tests
         git_cmd("switch", "seat/gate-test-1", cwd=seat_wt)
         git_cmd("reset", "--hard", "integration", cwd=seat_wt)
-        subprocess.run(["git", "-C", str(REPO_ROOT), "branch", "-D", "task/T-GATE-FAIL-04"], capture_output=True)
+        subprocess.run(["git", "-C", str(REPO_ROOT), "branch", "-D", f"task/{task_id}"], capture_output=True)
 
     def test_05_locking_and_recovery(self) -> None:
         """Invariant: merge lock prevents concurrent merges; recover clears lock."""
+        task_id = f"T-LOCK-05-{int(time.time()*1000)}"
         run_gate("init-seat", "gate-test-1")
-        run_gate("assign", "T-LOCK-05", "gate-test-1")
+        run_gate("assign", task_id, "gate-test-1")
         seat_wt = REPO_ROOT / ".worktrees" / "gate-test-1"
 
         filename = f"lock_{int(time.time())}.txt"
@@ -171,7 +174,7 @@ class TestWorktreeGate(unittest.TestCase):
         (lock_dir / "started").write_text("0\n")
 
         # Attempt review should report lock conflict (exit 75)
-        res = run_gate("review", "T-LOCK-05", "gate-test-1", f"test -f {filename}")
+        res = run_gate("review", task_id, "gate-test-1", f"test -f {filename}")
         self.assertEqual(res.returncode, 75, f"Review should hit lock contention: {res.stderr}")
 
         # Run recover
@@ -180,10 +183,10 @@ class TestWorktreeGate(unittest.TestCase):
         self.assertFalse(lock_dir.exists(), "Lock should be cleared after recover --force")
 
         # Now review should succeed after recovery
-        res2 = run_gate("review", "T-LOCK-05", "gate-test-1", f"test -f {filename}")
+        res2 = run_gate("review", task_id, "gate-test-1", f"test -f {filename}")
         self.assertEqual(res2.returncode, 0, f"Review should succeed after recovery: {res2.stderr}\nstdout: {res2.stdout}")
-        self.assertEqual(run_gate("status", "T-LOCK-05").stdout.strip(), "DONE")
-        run_gate("release", "T-LOCK-05", "gate-test-1")
+        self.assertEqual(run_gate("status", task_id).stdout.strip(), "DONE")
+        run_gate("release", task_id, "gate-test-1")
 
 
 if __name__ == "__main__":

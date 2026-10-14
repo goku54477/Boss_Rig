@@ -7,7 +7,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from orchestrator.models import BridgeEvent, TaskRecord, TaskState
+from orchestrator.models import BridgeEvent, SeatMode, TaskRecord, TaskState
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = REPO_ROOT / ".openrig-bridge" / "tasks.sqlite"
@@ -71,6 +71,14 @@ class TaskStore:
                     reason TEXT,
                     metadata_json TEXT,
                     created_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS seat_controls (
+                    seat_id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL DEFAULT 'AUTOMATED',
+                    reason TEXT,
+                    held_by TEXT,
+                    updated_at REAL NOT NULL
                 );
                 """
             )
@@ -286,3 +294,67 @@ class TaskStore:
 
     def cancel_task(self, task_id: str, reason: str = "") -> TaskRecord:
         return self.transition_task(task_id, TaskState.CANCELLED, reason=reason)
+
+    def set_seat_mode(
+        self,
+        seat_id: str,
+        mode: SeatMode,
+        reason: str = "",
+        held_by: str = "operator",
+    ) -> Dict[str, Any]:
+        """Update or insert the operational mode of a seat."""
+        now = time.time()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO seat_controls (seat_id, mode, reason, held_by, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(seat_id) DO UPDATE SET
+                    mode = excluded.mode,
+                    reason = excluded.reason,
+                    held_by = excluded.held_by,
+                    updated_at = excluded.updated_at
+                """,
+                (seat_id, mode.value, reason, held_by, now),
+            )
+        return self.get_seat_mode(seat_id)
+
+    def get_seat_mode(self, seat_id: str) -> Dict[str, Any]:
+        """Fetch current seat operational mode (defaulting to AUTOMATED)."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT seat_id, mode, reason, held_by, updated_at FROM seat_controls WHERE seat_id = ?",
+                (seat_id,),
+            ).fetchone()
+            if row:
+                return {
+                    "seat_id": row["seat_id"],
+                    "mode": SeatMode(row["mode"]),
+                    "reason": row["reason"] or "",
+                    "held_by": row["held_by"] or "",
+                    "updated_at": row["updated_at"],
+                }
+            return {
+                "seat_id": seat_id,
+                "mode": SeatMode.AUTOMATED,
+                "reason": "",
+                "held_by": "",
+                "updated_at": 0.0,
+            }
+
+    def list_seat_modes(self) -> Dict[str, Dict[str, Any]]:
+        """List operational modes for all registered seats."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT seat_id, mode, reason, held_by, updated_at FROM seat_controls"
+            ).fetchall()
+            result = {}
+            for row in rows:
+                result[row["seat_id"]] = {
+                    "seat_id": row["seat_id"],
+                    "mode": SeatMode(row["mode"]),
+                    "reason": row["reason"] or "",
+                    "held_by": row["held_by"] or "",
+                    "updated_at": row["updated_at"],
+                }
+            return result

@@ -132,6 +132,28 @@ Inspect full lifecycle history and bridge events for any task:
   ./scripts/boss-orchestrator stop <task_id> --reason "Spec superseded"
   ```
 
+### Manual Operator Intervention & Seat Holds
+To manually inspect or operate inside an engine's seat without interference from automated orchestrator injection:
+1. **Place the seat on `MANUAL_HOLD`**:
+   ```bash
+   ./scripts/boss-orchestrator seat hold codex-1 --reason "Manual debugging of worktree divergence"
+   ```
+   *While on hold, any automated dispatch targeting `codex-1` will be immediately rejected with `SeatHoldError` and marked `BLOCKED`.*
+2. **Inspect or edit the seat worktree**:
+   ```bash
+   cd .worktrees/codex-1
+   git status
+   # Run ad-hoc tests, debug tools, or OpenRig TUI commands
+   ```
+3. **Check operational modes across all seats**:
+   ```bash
+   ./scripts/boss-orchestrator seat status
+   ```
+4. **Release the seat back to automation**:
+   ```bash
+   ./scripts/boss-orchestrator seat release codex-1
+   ```
+
 ---
 
 ## 3. OpenRig TUI & Session Inspection
