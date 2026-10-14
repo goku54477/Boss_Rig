@@ -15,6 +15,13 @@ from typing import Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from orchestrator.engine import OrchestrationEngine, run_gate
 from orchestrator.models import KNOWN_ENGINES, SeatMode, TaskRecord, TaskState
 from orchestrator.policy import PolicyEngine
