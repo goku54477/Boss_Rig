@@ -2,7 +2,7 @@
 
 **Verdict:** `PASSED`
 **Passed:** `15 / 15`
-**Execution Time:** 2026-10-14 11:21:12
+**Execution Time:** 2026-10-14 11:23:12
 **Environment:** WSL2 Ubuntu 24.04 LTS / OpenRig 0.6.10
 
 ---
@@ -22,7 +22,7 @@ A comprehensive 15-task soak test was conducted across the multi-agent control p
 | 04 | Independent Review Enforcement | ✅ PASS | PolicyViolation correctly raised on codex-1 self-review |
 | 05 | Commit Pinning Enforcement | ✅ PASS | Rejected unpinned candidate commit |
 | 06 | Gate Failure Isolation | ✅ PASS | Failing test moved task to REVIEW_FAILED; merge aborted |
-| 07 | Deterministic Gate & Merge | ✅ PASS | Verified & merged to integration (4b1ce636) |
+| 07 | Deterministic Gate & Merge | ✅ PASS | Verified & merged to integration (f83082f4) |
 | 08 | Operator Seat Hold Safety | ✅ PASS | SeatHoldError raised & task transitioned to BLOCKED |
 | 09 | Seat Release Restoration | ✅ PASS | codex-1 mode: AUTOMATED |
 | 10 | Task Pause & Resume | ✅ PASS | Transitions ACTIVE -> BLOCKED -> ACTIVE verified |
@@ -30,7 +30,7 @@ A comprehensive 15-task soak test was conducted across the multi-agent control p
 | 12 | Stale Lock Deterministic Recovery | ✅ PASS | openrig-merge.lock cleared cleanly |
 | 13 | Event Idempotency | ✅ PASS | Duplicate event dropped via unique event_id constraint |
 | 14 | Worktree Physical Isolation | ✅ PASS | All 3 seats verified on discrete filesystem worktrees |
-| 15 | SQLite PRAGMA Integrity Check | ✅ PASS | PRAGMA: ok | Tasks: 17, Events: 15, Transitions: 12 |
+| 15 | SQLite PRAGMA Integrity Check | ✅ PASS | PRAGMA: ok | Tasks: 18, Events: 16, Transitions: 16 |
 
 ---
 
