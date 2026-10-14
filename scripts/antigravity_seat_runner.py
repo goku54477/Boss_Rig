@@ -204,6 +204,7 @@ class AntigravitySession:
         agent_response_done = False
         last_step_data = {}
         drain_timeout_sec = float(os.environ.get("ANTIGRAVITY_DRAIN_TIMEOUT_SEC", "1.5"))
+        last_hb_time = start_time
 
         with open(LOG_PATH, "a", encoding="utf-8") as log_file:
             while True:
@@ -222,6 +223,18 @@ class AntigravitySession:
                         extra_data={"timeout_sec": timeout_sec},
                     )
                     return
+
+                now = time.time()
+                if now - last_hb_time >= 5.0:
+                    last_hb_time = now
+                    emit_bridge_event(
+                        "task_heartbeat",
+                        task_id,
+                        role,
+                        "RUNNING",
+                        attempt=attempt,
+                        extra_data={"elapsed_sec": int(now - start_time)},
+                    )
 
                 line = self.read_line(timeout_sec=min(remaining, 1.0))
                 if line is None:

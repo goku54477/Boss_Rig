@@ -1,15 +1,15 @@
 # Live Multi-Agent Concurrency & Merge Lock Contention Report
 
-**Generated:** 2026-10-14T11:06:13Z  
+**Generated:** 2026-10-14T15:47:49Z  
 **Architecture:** Per-seat Git worktrees + Single Global Deterministic Merge Lock + Integration Revalidation
 
 ## Concurrent Execution Results
 
 | Task ID | Seat | Feature Module | Start Time | End Time | Duration (s) | Merge Status |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: |
-| `T-CONCUR-opencode-1-1791975964` | `opencode-1` | `concur_mod_opencode_1_1791975964.py` | `11:06:04` | `11:06:07` | 2.72s | ✅ **MERGED** |
-| `T-CONCUR-antigravity-1-1791975964` | `antigravity-1` | `concur_mod_antigravity_1_1791975964.py` | `11:06:04` | `11:06:08` | 3.76s | ✅ **MERGED** |
-| `T-CONCUR-codex-1-1791975964` | `codex-1` | `concur_mod_codex_1_1791975964.py` | `11:06:04` | `11:06:09` | 4.89s | ✅ **MERGED** |
+| `T-CONCUR-opencode-1-1791992854` | `opencode-1` | `concur_mod_opencode_1_1791992854.py` | `15:47:34` | `15:47:37` | 3.91s | ✅ **MERGED** |
+| `T-CONCUR-antigravity-1-1791992854` | `antigravity-1` | `concur_mod_antigravity_1_1791992854.py` | `15:47:34` | `15:47:39` | 5.46s | ✅ **MERGED** |
+| `T-CONCUR-codex-1-1791992854` | `codex-1` | `concur_mod_codex_1_1791992854.py` | `15:47:34` | `15:47:41` | 6.98s | ✅ **MERGED** |
 
 ## Concurrency Invariants Proven
 

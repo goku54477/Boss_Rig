@@ -90,6 +90,49 @@ branch_worktree() {
   return 1
 }
 
+sanitize_worktree_preflight() {
+  local dir="$1"
+  local status_output
+  status_output="$(git -C "$dir" status --porcelain)"
+  [[ -z "$status_output" ]] && return 0
+
+  # Step 1: Reject if there is ANY tracked modification, staging, or deletion
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local prefix="${line:0:2}"
+    if [[ "$prefix" != "??" ]]; then
+      echo "worktree has uncommitted tracked changes (refusing auto-sanitization): $dir" >&2
+      return 1
+    fi
+  done <<< "$status_output"
+
+  # Step 2: For each untracked file, verify against safe generated artifact patterns
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local rel_file="${line:3}"
+    local base
+    base="$(basename "$rel_file")"
+
+    case "$base" in
+      matrix_proof_*|*_proof_*.txt|proof_*.txt|spec_*.json|*.pyc|__pycache__|*.log|.openrig-*-seat.log|.pytest_cache|*.tmp)
+        rm -rf -- "$dir/$rel_file"
+        echo "preflight: sanitized safe generated artifact: $rel_file" >&2
+        ;;
+      *)
+        echo "worktree has untracked user/unknown file (refusing deletion): $rel_file" >&2
+        return 1
+        ;;
+    esac
+  done <<< "$status_output"
+
+  # Step 3: Verify the directory is now clean
+  if [[ -n "$(git -C "$dir" status --porcelain)" ]]; then
+    echo "worktree remains dirty after sanitization: $dir" >&2
+    return 1
+  fi
+  return 0
+}
+
 require_clean() {
   local dir="$1"
   if [[ -n "$(git -C "$dir" status --porcelain)" ]]; then
@@ -254,6 +297,7 @@ case "$cmd" in
       exit 2
     }
 
+    sanitize_worktree_preflight "$wt"
     require_clean "$wt"
 
     if other="$(branch_worktree "$branch" 2>/dev/null)" && [[ "$other" != "$wt" ]]; then

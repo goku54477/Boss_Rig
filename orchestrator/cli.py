@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from orchestrator.engine import OrchestrationEngine, run_gate
 from orchestrator.models import KNOWN_ENGINES, SeatMode, TaskRecord, TaskState
+from orchestrator.policy import PolicyEngine
 from orchestrator.store import TaskStore
 
 
@@ -150,30 +151,77 @@ def cmd_task_show(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     engine = OrchestrationEngine()
+    store = engine.store
     ts = int(time.time())
     task_id = args.task_id or f"T-RUN-{ts}"
     goal = args.goal
     verify_cmd = args.verify or "true"
 
-    planner = args.planner or "antigravity-1"
-    implementer = args.implementer or "opencode-1"
-    reviewer = args.reviewer or "codex-1"
+    available = [
+        e for e in KNOWN_ENGINES
+        if store.get_seat_mode(e).get("mode") == SeatMode.AUTOMATED
+    ]
+    if len(available) < 2:
+        print(f"❌ Error: At least 2 active automated engines required, found {available}")
+        return 1
+
+    tasks = store.list_tasks()
+    usage = {e: 0 for e in available}
+    for t in tasks:
+        if t.planner in usage:
+            usage[t.planner] += 1
+        if t.implementer in usage:
+            usage[t.implementer] += 1
+        if t.reviewer in usage:
+            usage[t.reviewer] += 1
+
+    sorted_by_usage = sorted(available, key=lambda e: usage[e])
+
+    planner = args.planner or sorted_by_usage[0]
+    cand_impls = [e for e in available if e != planner] if len(available) > 1 else available
+    cand_impls_sorted = sorted(cand_impls, key=lambda e: usage[e])
+    implementer = args.implementer or cand_impls_sorted[0]
+
+    reviewer = args.reviewer or PolicyEngine.select_reviewer(
+        implementer=implementer, available_engines=available, planner=planner
+    )
 
     print(f"🎯 Starting task: {task_id}")
     print(f"   Goal: {goal}")
-    print(f"   Planner: {planner} | Implementer: {implementer} | Reviewer: {reviewer}")
+    print(f"   Dynamic Engine Roles -> Planner: {planner} | Implementer: {implementer} | Reviewer: {reviewer}")
     print(f"   Verification: {verify_cmd}")
 
     task = engine.create_task(task_id, goal=goal, verification_commands=[verify_cmd])
+    if task.context and task.context.get("items"):
+        print(f"   🧠 Goldfish Context Priming: {task.context['count']} relevant project memories primed")
+
+    def make_activity_cb(seat_name: str, role_name: str):
+        def on_activity(info: Dict[str, Any]) -> None:
+            evt_name = info.get("event", "heartbeat")
+            elapsed = info.get("elapsed_sec") or info.get("data", {}).get("elapsed_sec") or "?"
+            if evt_name == "task_started":
+                sys.stdout.write(f"\r  ▶ [{seat_name}:{role_name}] started execution...            ")
+            else:
+                sys.stdout.write(f"\r  ⏳ [{seat_name}:{role_name}] working... ({elapsed}s elapsed)   ")
+            sys.stdout.flush()
+        return on_activity
 
     # 1. Plan
     print(f"\n[1/4] Running planning turn on {planner}...")
     engine.assign_role(task_id, engine=planner, role="planner")
+    planner_prompt = f"Formulate a plan in plain text for: {goal}. Do not call tools."
+    if task.context and task.context.get("summary"):
+        planner_prompt += f"\n\n[Project Context from Goldfish Memory]:\n{task.context['summary']}"
+
     p_res = engine.execute_turn(
-        task_id, engine=planner, role="planner",
-        prompt=f"Formulate a plan in plain text for: {goal}. Do not call tools.",
+        task_id,
+        engine=planner,
+        role="planner",
+        prompt=planner_prompt,
         timeout_sec=120,
+        on_activity=make_activity_cb(planner, "planner"),
     )
+    sys.stdout.write("\n")
     if p_res.get("status") != "SUCCESS":
         print(f"❌ Planning failed: {p_res}")
         return 1
@@ -183,10 +231,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"\n[2/4] Running implementation turn on {implementer}...")
     engine.assign_role(task_id, engine=implementer, role="implementer")
     i_res = engine.execute_turn(
-        task_id, engine=implementer, role="implementer",
-        prompt=f"Implement: {goal}. Confirm committed changes.",
+        task_id,
+        engine=implementer,
+        role="implementer",
+        prompt=f"Implement: {goal}. Write the code into the file, run git add and git commit, and confirm committed changes.",
         timeout_sec=120,
+        on_activity=make_activity_cb(implementer, "implementer"),
     )
+    sys.stdout.write("\n")
     if i_res.get("status") != "SUCCESS":
         print(f"❌ Implementation failed: {i_res}")
         return 1
@@ -196,10 +248,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"\n[3/4] Running independent review on {reviewer}...")
     engine.assign_role(task_id, engine=reviewer, role="reviewer")
     r_res = engine.execute_turn(
-        task_id, engine=reviewer, role="reviewer",
+        task_id,
+        engine=reviewer,
+        role="reviewer",
         prompt=f"Review candidate commit {task.candidate_commit} for: {goal}. Reply PASS if verified.",
         timeout_sec=120,
+        on_activity=make_activity_cb(reviewer, "reviewer"),
     )
+    sys.stdout.write("\n")
     if r_res.get("status") != "SUCCESS":
         print(f"❌ Review failed: {r_res}")
         return 1
@@ -337,9 +393,9 @@ def main() -> int:
     p_run.add_argument("goal", help="Feature task goal")
     p_run.add_argument("--task-id", help="Custom task ID")
     p_run.add_argument("--verify", help="Verification command")
-    p_run.add_argument("--planner", help="Planner seat ID", default="antigravity-1")
-    p_run.add_argument("--implementer", help="Implementer seat ID", default="opencode-1")
-    p_run.add_argument("--reviewer", help="Reviewer seat ID", default="codex-1")
+    p_run.add_argument("--planner", help="Planner seat ID (default: dynamic least-loaded)", default=None)
+    p_run.add_argument("--implementer", help="Implementer seat ID (default: dynamic least-loaded)", default=None)
+    p_run.add_argument("--reviewer", help="Reviewer seat ID (default: dynamic 3-engine rotation)", default=None)
 
     # pause
     p_pause = subparsers.add_parser("pause", help="Pause / block a task")

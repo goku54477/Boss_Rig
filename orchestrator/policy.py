@@ -25,8 +25,13 @@ class PolicyEngine:
         implementer: str,
         preferred_engine: Optional[str] = None,
         available_engines: Optional[List[str]] = None,
+        planner: Optional[str] = None,
     ) -> str:
-        """Enforce Independent Review Policy: reviewer MUST NOT be implementer."""
+        """Enforce Independent Review Policy: reviewer MUST NOT be implementer.
+
+        When >= 3 healthy engines are available, prefers a third distinct engine
+        so that reviewer != implementer and reviewer != planner.
+        """
         candidates = list(available_engines or KNOWN_ENGINES)
         if implementer in candidates:
             candidates.remove(implementer)
@@ -38,6 +43,12 @@ class PolicyEngine:
 
         if preferred_engine and preferred_engine in candidates:
             return preferred_engine
+
+        # If planner is provided, prefer a distinct third engine (reviewer != planner)
+        if planner:
+            third_party = [e for e in candidates if e != planner]
+            if third_party:
+                return third_party[0]
 
         return candidates[0]
 
