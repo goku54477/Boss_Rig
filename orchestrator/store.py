@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 from orchestrator.models import BridgeEvent, SeatMode, TaskRecord, TaskState
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -26,10 +27,33 @@ class TaskStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA busy_timeout = 30000;")
         return conn
 
+    @contextlib.contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
+        """Context manager providing a SQLite connection with busy retry and backoff."""
+        max_retries = 8
+        delay = 0.05
+        for attempt in range(max_retries):
+            try:
+                conn = self._get_connection()
+                try:
+                    with conn:
+                        yield conn
+                    return
+                finally:
+                    conn.close()
+            except sqlite3.OperationalError as exc:
+                err_msg = str(exc).lower()
+                if ("locked" in err_msg or "busy" in err_msg) and attempt < max_retries - 1:
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, 1.0)
+                    continue
+                raise
+
     def _init_db(self) -> None:
-        with self._get_connection() as conn:
+        with self._connect() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -86,7 +110,7 @@ class TaskStore:
     def save_task(self, task: TaskRecord) -> None:
         now = time.time()
         v_cmds_json = json.dumps(task.verification_commands)
-        with self._get_connection() as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO tasks (
@@ -130,7 +154,7 @@ class TaskStore:
             )
 
     def get_task(self, task_id: str) -> Optional[TaskRecord]:
-        with self._get_connection() as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
@@ -190,7 +214,7 @@ class TaskStore:
             params.append(state.value if isinstance(state, TaskState) else str(state))
         query += " ORDER BY created_at DESC"
 
-        with self._get_connection() as conn:
+        with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
             tasks: List[TaskRecord] = []
             for r in rows:
@@ -226,7 +250,7 @@ class TaskStore:
         now = time.time()
         data_json = json.dumps(data)
 
-        with self._get_connection() as conn:
+        with self._connect() as conn:
             try:
                 conn.execute(
                     """
@@ -267,7 +291,7 @@ class TaskStore:
         task.transition(new_state, reason=reason, **metadata)
         now = time.time()
 
-        with self._get_connection() as conn:
+        with self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET state = ?, updated_at = ? WHERE task_id = ?",
                 (new_state.value, now, task_id),
@@ -304,7 +328,7 @@ class TaskStore:
     ) -> Dict[str, Any]:
         """Update or insert the operational mode of a seat."""
         now = time.time()
-        with self._get_connection() as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO seat_controls (seat_id, mode, reason, held_by, updated_at)
@@ -321,7 +345,7 @@ class TaskStore:
 
     def get_seat_mode(self, seat_id: str) -> Dict[str, Any]:
         """Fetch current seat operational mode (defaulting to AUTOMATED)."""
-        with self._get_connection() as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 "SELECT seat_id, mode, reason, held_by, updated_at FROM seat_controls WHERE seat_id = ?",
                 (seat_id,),
@@ -344,7 +368,7 @@ class TaskStore:
 
     def list_seat_modes(self) -> Dict[str, Dict[str, Any]]:
         """List operational modes for all registered seats."""
-        with self._get_connection() as conn:
+        with self._connect() as conn:
             rows = conn.execute(
                 "SELECT seat_id, mode, reason, held_by, updated_at FROM seat_controls"
             ).fetchall()

@@ -125,6 +125,32 @@ class TestTaskStoreAndIdempotency(unittest.TestCase):
         )
         self.assertTrue(self.store.record_event(evt_attempt_2))
 
+    def test_05_concurrent_writers_and_busy_backoff(self) -> None:
+        """Prove that concurrent writers succeed without SQLITE_BUSY errors due to busy_timeout & retry backoff."""
+        import concurrent.futures
+
+        num_tasks = 30
+
+        def write_worker(idx: int) -> str:
+            tid = f"T-CONC-{idx}"
+            task = TaskRecord(task_id=tid, state=TaskState.QUEUED, goal=f"Goal {idx}")
+            self.store.save_task(task)
+            self.store.transition_task(tid, TaskState.ASSIGNED, reason="test assignment")
+            self.store.transition_task(tid, TaskState.ACTIVE, reason="test active")
+            return tid
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(write_worker, i) for i in range(num_tasks)]
+            results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        self.assertEqual(len(results), num_tasks)
+        for i in range(num_tasks):
+            t = self.store.get_task(f"T-CONC-{i}")
+            self.assertIsNotNone(t)
+            self.assertEqual(t.state, TaskState.ACTIVE)
+            self.assertEqual(len(t.history), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
+

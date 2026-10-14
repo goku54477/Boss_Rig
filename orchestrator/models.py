@@ -93,6 +93,7 @@ class TaskRecord:
     merge_commit: Optional[str] = None
     attempt: int = 1
     max_attempts: int = 2
+    context: Optional[Dict[str, Any]] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
 
     def transition(self, new_state: TaskState, reason: str = "", **metadata: Any) -> None:

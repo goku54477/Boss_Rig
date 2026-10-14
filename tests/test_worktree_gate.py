@@ -188,6 +188,54 @@ class TestWorktreeGate(unittest.TestCase):
         self.assertEqual(run_gate("status", task_id).stdout.strip(), "DONE")
         run_gate("release", task_id, "gate-test-1")
 
+    def test_07_safe_worktree_preflight_sanitization(self) -> None:
+        """Requirement: Preflight sanitizes safe generated artifacts, but never deletes user untracked or tracked work."""
+        seat_wt = REPO_ROOT / ".worktrees" / "gate-test-1"
+        run_gate("init-seat", "gate-test-1")
+
+        # Case A: Safe generated artifact is sanitized automatically
+        safe_artifact = seat_wt / "matrix_proof_gate-test-1.txt"
+        safe_artifact.write_text("automated proof\n")
+        self.assertTrue(safe_artifact.exists())
+
+        task_a = f"T-GATE-SAFE-{int(time.time()*1000)}"
+        res_a = run_gate("assign", task_a, "gate-test-1")
+        self.assertEqual(res_a.returncode, 0, f"assign should succeed after auto-sanitizing safe artifact: {res_a.stderr}")
+        self.assertFalse(safe_artifact.exists(), "Safe generated artifact should have been sanitized")
+
+        # Reset seat back to seat parking branch
+        subprocess.run(["git", "-C", str(seat_wt), "checkout", "seat/gate-test-1"], capture_output=True)
+        subprocess.run(["git", "-C", str(seat_wt), "reset", "--hard", "integration"], capture_output=True)
+
+        # Case B: Untracked user file is NOT deleted, assignment fails safely
+        user_file = seat_wt / "user_notes.md"
+        user_file.write_text("# Important user notes\n")
+        self.assertTrue(user_file.exists())
+
+        task_b = f"T-GATE-USER-{int(time.time()*1000)}"
+        res_b = run_gate("assign", task_b, "gate-test-1")
+        self.assertNotEqual(res_b.returncode, 0, "assign must fail when user untracked file is present")
+        self.assertTrue(user_file.exists(), "Untracked user file MUST NOT be deleted")
+        self.assertIn("refusing deletion", res_b.stderr)
+
+        # Clean user file manually for Case C
+        user_file.unlink()
+
+        # Case C: Tracked uncommitted modification is NOT deleted, assignment fails safely
+        tracked_file = seat_wt / "README.md"
+        if tracked_file.exists():
+            original_content = tracked_file.read_text()
+            tracked_file.write_text(original_content + "\n# Uncommitted user edit\n")
+
+            task_c = f"T-GATE-TRACKED-{int(time.time()*1000)}"
+            res_c = run_gate("assign", task_c, "gate-test-1")
+            self.assertNotEqual(res_c.returncode, 0, "assign must fail when tracked modifications exist")
+            self.assertIn("tracked changes", res_c.stderr)
+
+            # Revert tracked modification
+            subprocess.run(["git", "-C", str(seat_wt), "checkout", "--", "README.md"], capture_output=True)
+
 
 if __name__ == "__main__":
     unittest.main()
+

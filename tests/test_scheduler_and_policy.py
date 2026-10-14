@@ -90,6 +90,37 @@ class TestSchedulerAndPolicy(unittest.TestCase):
         task.transition(TaskState.DONE)
         self.assertEqual(task.state, TaskState.DONE)
 
+    def test_05_three_engine_distinct_reviewer_preference(self) -> None:
+        """Requirement: When >=3 engines available, prefer reviewer != implementer AND reviewer != planner."""
+        engines = ["codex-1", "opencode-1", "antigravity-1"]
+
+        # Case 1: planner=codex-1, implementer=opencode-1 -> reviewer must be antigravity-1
+        rev1 = PolicyEngine.select_reviewer(
+            implementer="opencode-1", available_engines=engines, planner="codex-1"
+        )
+        self.assertEqual(rev1, "antigravity-1")
+
+        # Case 2: planner=antigravity-1, implementer=codex-1 -> reviewer must be opencode-1
+        rev2 = PolicyEngine.select_reviewer(
+            implementer="codex-1", available_engines=engines, planner="antigravity-1"
+        )
+        self.assertEqual(rev2, "opencode-1")
+
+        # Case 3: planner=opencode-1, implementer=antigravity-1 -> reviewer must be codex-1
+        rev3 = PolicyEngine.select_reviewer(
+            implementer="antigravity-1", available_engines=engines, planner="opencode-1"
+        )
+        self.assertEqual(rev3, "codex-1")
+
+        # Case 4: Graceful 2-engine fallback when only 2 engines available
+        two_engines = ["codex-1", "opencode-1"]
+        rev4 = PolicyEngine.select_reviewer(
+            implementer="opencode-1", available_engines=two_engines, planner="codex-1"
+        )
+        self.assertEqual(rev4, "codex-1")
+        self.assertNotEqual(rev4, "opencode-1")
+
 
 if __name__ == "__main__":
     unittest.main()
+

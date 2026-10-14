@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from orchestrator.dispatcher import SeatHoldError, TaskDispatcher
+from orchestrator.goldfish import GoldfishPrimer
 from orchestrator.models import SeatMode, TaskEnvelope, TaskRecord, TaskState
 from orchestrator.policy import PolicyEngine, PolicyViolation
 from orchestrator.store import TaskStore
@@ -44,8 +45,9 @@ class OrchestrationEngine:
         task_id: str,
         goal: str,
         verification_commands: Optional[List[str]] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> TaskRecord:
-        """Create an idempotent task record."""
+        """Create an idempotent task record with automatic Goldfish memory priming."""
         if task_id in self.tasks:
             return self.tasks[task_id]
 
@@ -54,11 +56,18 @@ class OrchestrationEngine:
             self.tasks[task_id] = existing
             return existing
 
+        # Automatic Goldfish context priming if not provided
+        if context is None:
+            primer = GoldfishPrimer()
+            if primer.is_available:
+                context = primer.search_memory(goal)
+
         record = TaskRecord(
             task_id=task_id,
             state=TaskState.QUEUED,
             goal=goal,
             verification_commands=verification_commands or ["true"],
+            context=context,
         )
         record.transition(TaskState.QUEUED, reason="Task created")
         self.tasks[task_id] = record
@@ -91,6 +100,7 @@ class OrchestrationEngine:
         role: str,
         prompt: Optional[str] = None,
         timeout_sec: int = 60,
+        on_activity: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Execute a turn with an engine and manage worktree binding."""
         task = self.tasks[task_id]
@@ -134,9 +144,12 @@ class OrchestrationEngine:
             goal=prompt or task.goal,
             candidate_commit=task.candidate_commit,
             timeout_sec=timeout_sec,
+            context=task.context,
         )
 
-        event = self.dispatcher.dispatch_task(engine, envelope, timeout_sec=timeout_sec)
+        event = self.dispatcher.dispatch_task(
+            engine, envelope, timeout_sec=timeout_sec, on_activity=on_activity
+        )
         status = event.get("status", "ERROR")
 
         if status == "SUCCESS":

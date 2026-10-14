@@ -108,9 +108,27 @@ def run_opencode_task(
             start_new_session=True,
         )
 
-        try:
-            exit_code = proc.wait(timeout=timeout_sec)
-        except subprocess.TimeoutExpired:
+        start_t = time.time()
+        last_hb = start_t
+        exit_code = None
+        while time.time() - start_t < timeout_sec:
+            try:
+                exit_code = proc.wait(timeout=2.0)
+                break
+            except subprocess.TimeoutExpired:
+                now = time.time()
+                if now - last_hb >= 5.0:
+                    last_hb = now
+                    emit_bridge_event(
+                        "task_heartbeat",
+                        task_id,
+                        role,
+                        "RUNNING",
+                        attempt=attempt,
+                        extra_data={"elapsed_sec": int(now - start_t)},
+                    )
+
+        if exit_code is None:
             try:
                 os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
                 proc.wait(timeout=3)

@@ -124,10 +124,24 @@ def run_codex_task(
         deadline = time.time() + timeout_sec
         timed_out = False
 
+        start_t = time.time()
+        last_hb = start_t
         # Read streaming json lines from codex exec
         assert proc.stdout is not None
         while True:
             line = proc.stdout.readline()
+            now = time.time()
+            if now - last_hb >= 5.0:
+                last_hb = now
+                emit_bridge_event(
+                    "task_heartbeat",
+                    task_id,
+                    role,
+                    "RUNNING",
+                    attempt=attempt,
+                    extra_data={"elapsed_sec": int(now - start_t)},
+                )
+
             if not line:
                 if proc.poll() is not None:
                     break

@@ -88,19 +88,43 @@ class SeatBridgeProcess:
         return None
 
     def read_until_event(
-        self, event_name: str, timeout_sec: float = 60.0
+        self,
+        event_name: str,
+        timeout_sec: float = 60.0,
+        on_activity: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
-        deadline = time.time() + timeout_sec
+        start_time = time.time()
+        last_hb = start_time
+        deadline = start_time + timeout_sec
         while time.time() < deadline:
             rem = deadline - time.time()
             if rem <= 0:
                 break
-            evt = self.read_event(timeout_sec=rem)
+            # Use small slice (max 1.0s) so timer heartbeats fire reliably
+            evt = self.read_event(timeout_sec=min(rem, 1.0))
+            now = time.time()
             if evt:
+                if on_activity:
+                    try:
+                        on_activity(evt)
+                    except Exception:
+                        pass
                 if evt.get("event") == event_name:
                     return evt
                 if evt.get("event") in ("task_result", "task_failed", "task_timeout"):
                     return evt
+
+            if now - last_hb >= 3.0:
+                last_hb = now
+                if on_activity:
+                    try:
+                        on_activity({
+                            "event": "heartbeat",
+                            "seat_id": self.seat_id,
+                            "elapsed_sec": round(now - start_time, 1),
+                        })
+                    except Exception:
+                        pass
         return None
 
     def is_alive(self) -> bool:
@@ -163,6 +187,7 @@ class TaskDispatcher:
         engine: str,
         envelope: TaskEnvelope,
         timeout_sec: Optional[int] = None,
+        on_activity: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Dispatch task to engine and wait for completion event."""
         if self.store is not None:
@@ -179,11 +204,17 @@ class TaskDispatcher:
         raw_payload = json.dumps(envelope.to_dict())
         bridge.send_line(raw_payload)
 
+        def _read_evt(event_name: str, t_sec: float) -> Optional[Dict[str, Any]]:
+            try:
+                return bridge.read_until_event(event_name, timeout_sec=t_sec, on_activity=on_activity)
+            except TypeError:
+                return bridge.read_until_event(event_name, timeout_sec=t_sec)
+
         # Wait for task_started
-        start_evt = bridge.read_until_event("task_started", timeout_sec=10.0)
+        start_evt = _read_evt("task_started", 10.0)
 
         # Wait for terminal event: task_result, task_timeout, or task_failed
-        term_evt = bridge.read_until_event("task_result", timeout_sec=float(timeout))
+        term_evt = _read_evt("task_result", float(timeout))
         if not term_evt:
             return {
                 "status": "TIMEOUT",
