@@ -60,6 +60,22 @@ def emit_bridge_event(
             pass
 
 
+def build_agy_command(extra_args: Optional[list[str]] = None) -> list[str]:
+    """Construct agy command. Safe by default; dangerous permissions require explicit opt-in."""
+    cmd = [
+        "agy",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+    ]
+    if os.environ.get("AGY_DANGEROUS_SKIP_PERMISSIONS", "0").lower() in ("1", "true", "yes"):
+        cmd.append("--dangerously-skip-permissions")
+    if extra_args:
+        cmd.extend(extra_args)
+    return cmd
+
+
 class AntigravitySession:
     """Manages an active agy process with stream-json input/output."""
 
@@ -71,14 +87,7 @@ class AntigravitySession:
         self._start_process()
 
     def _start_process(self) -> None:
-        cmd = [
-            "agy",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--dangerously-skip-permissions",
-        ]
+        cmd = build_agy_command()
         self.proc = subprocess.Popen(
             cmd,
             cwd=self.cwd,
@@ -271,9 +280,11 @@ class AntigravitySession:
                     )
 
                     if step_data.get("state") == "DONE" and step_data.get("step_type") == "agent_response":
-                        # Check if a follow-up step (e.g. tool execution) is immediately dispatched
-                        next_line = self.read_line(timeout_sec=0.8)
-                        if next_line is None:
+                        # Peek ahead with 2.0s window to consume follow-up tool execution or result event
+                        next_line = self.read_line(timeout_sec=2.0)
+                        if next_line is not None:
+                            self.unread_line(next_line)
+                        else:
                             emit_bridge_event(
                                 "task_result",
                                 task_id,
@@ -288,8 +299,6 @@ class AntigravitySession:
                                 },
                             )
                             return
-                        else:
-                            self.unread_line(next_line)
 
                 elif provider_event == "result":
                     res_data = event_obj.get("result", {})

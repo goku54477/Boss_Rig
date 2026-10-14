@@ -29,12 +29,19 @@ def run_gate(*args: str) -> subprocess.CompletedProcess[str]:
 class AntigravityBridgeProcess:
     """Manages an active instance of antigravity-seat-runner.sh."""
 
-    def __init__(self, seat_id: str = "antigravity-1", cwd: Optional[Path] = None):
+    def __init__(
+        self,
+        seat_id: str = "antigravity-1",
+        cwd: Optional[Path] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ):
         self.seat_id = seat_id
         self.cwd = cwd or SEAT_WT
         env = os.environ.copy()
         env["OPENRIG_SEAT_ID"] = seat_id
         env["ANTIGRAVITY_TASK_TIMEOUT_SEC"] = "300"
+        if extra_env:
+            env.update(extra_env)
         self.proc = subprocess.Popen(
             ["bash", str(RUNNER_SCRIPT)],
             cwd=str(self.cwd),
@@ -177,7 +184,7 @@ class TestAntigravityBridge(unittest.TestCase):
             envelope = {
                 "task_id": task_id,
                 "role": "reviewer",
-                "goal": "Inspect the repository and state the seat directory.",
+                "goal": "State the current worktree directory and reply with: REVIEW_INSPECTION_OK.",
                 "timeout_sec": 45,
             }
             bridge.send_line(json.dumps(envelope))
@@ -206,7 +213,7 @@ class TestAntigravityBridge(unittest.TestCase):
         if proof_file.exists():
             proof_file.unlink()
 
-        bridge = AntigravityBridgeProcess()
+        bridge = AntigravityBridgeProcess(extra_env={"AGY_DANGEROUS_SKIP_PERMISSIONS": "1"})
         try:
             envelope = {
                 "task_id": task_id,
@@ -336,6 +343,26 @@ class TestAntigravityBridge(unittest.TestCase):
         bridge.send_line(":quit")
         bridge.proc.wait(timeout=5)
         self.assertEqual(bridge.proc.returncode, 0)
+
+    def test_08_permission_safety_mode(self) -> None:
+        """Requirement: Default execution must be safe; dangerous mode only with explicit opt-in."""
+        from scripts.antigravity_seat_runner import build_agy_command
+
+        # 1. Verify default is safe
+        safe_cmd = build_agy_command()
+        self.assertNotIn("--dangerously-skip-permissions", safe_cmd)
+
+        # 2. Verify explicit opt-in works
+        old_val = os.environ.get("AGY_DANGEROUS_SKIP_PERMISSIONS")
+        try:
+            os.environ["AGY_DANGEROUS_SKIP_PERMISSIONS"] = "1"
+            opt_cmd = build_agy_command()
+            self.assertIn("--dangerously-skip-permissions", opt_cmd)
+        finally:
+            if old_val is not None:
+                os.environ["AGY_DANGEROUS_SKIP_PERMISSIONS"] = old_val
+            else:
+                os.environ.pop("AGY_DANGEROUS_SKIP_PERMISSIONS", None)
 
 
 if __name__ == "__main__":
