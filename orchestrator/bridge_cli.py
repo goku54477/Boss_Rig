@@ -116,6 +116,25 @@ def cmd_token(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ask_question(args: argparse.Namespace) -> int:
+    service = TaskService()
+    task_id = args.task_id
+    if not task_id:
+        active_tasks = service.task_list(state="ACTIVE")
+        if active_tasks:
+            task_id = active_tasks[0]["task_id"]
+        else:
+            print("Error: No active task found in store. Pass --task-id.", file=sys.stderr)
+            return 1
+    try:
+        ans = service.ask_user_question(task_id, args.prompt, timeout_sec=args.timeout)
+        print(ans)
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Boss Rig Bridge & Watcher CLI")
     subparsers = parser.add_subparsers(dest="subcommand", help="Bridge commands")
@@ -142,6 +161,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_q.add_argument("--task-id", help="Filter by task ID")
     p_q.add_argument("--status", default="PENDING", help="Filter by status (default: PENDING)")
 
+    # ask-question
+    p_ask = subparsers.add_parser("ask-question", help="Ask a question from agent to operator and wait for answer")
+    p_ask.add_argument("prompt", help="Question text for operator")
+    p_ask.add_argument("--task-id", help="Associated Task ID (defaults to active task)")
+    p_ask.add_argument("--timeout", type=float, default=300.0, help="Wait timeout in seconds (default: 300)")
+
     # answer
     p_ans = subparsers.add_parser("answer", help="Answer a pending question")
     p_ans.add_argument("question_id", help="Question ID to answer")
@@ -159,6 +184,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_tasks(args)
     elif args.subcommand == "questions":
         return cmd_questions(args)
+    elif args.subcommand == "ask-question":
+        return cmd_ask_question(args)
     elif args.subcommand == "answer":
         return cmd_answer(args)
     elif args.subcommand == "token":

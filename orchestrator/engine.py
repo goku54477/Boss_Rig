@@ -16,11 +16,12 @@ GATE_SCRIPT = REPO_ROOT / "scripts" / "worktree-gate.sh"
 WORKTREES_DIR = REPO_ROOT / ".worktrees"
 
 
-def run_gate(*args: str) -> subprocess.CompletedProcess[str]:
+def run_gate(*args: str, repo: Optional[Path] = None) -> subprocess.CompletedProcess[str]:
+    target = repo or REPO_ROOT
     cmd = ["bash", str(GATE_SCRIPT), *args]
     return subprocess.run(
         cmd,
-        cwd=REPO_ROOT,
+        cwd=str(target),
         capture_output=True,
         text=True,
     )
@@ -31,14 +32,20 @@ class OrchestrationEngine:
 
     def __init__(
         self,
+        target_repo: Optional[Path | str] = None,
         dispatcher: Optional[TaskDispatcher] = None,
         store: Optional[TaskStore] = None,
     ):
+        self.target_repo = Path(target_repo or REPO_ROOT).resolve()
+        self.worktrees_dir = self.target_repo / ".worktrees"
         self.store = store or TaskStore()
         self.tasks: Dict[str, TaskRecord] = {}
-        self.dispatcher = dispatcher or TaskDispatcher(store=self.store)
+        self.dispatcher = dispatcher or TaskDispatcher(store=self.store, worktrees_dir=self.worktrees_dir)
         if self.dispatcher.store is None:
             self.dispatcher.store = self.store
+
+    def run_gate(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return run_gate(*args, repo=self.target_repo)
 
     def create_task(
         self,
@@ -124,15 +131,15 @@ class OrchestrationEngine:
             )
 
         # Ensure seat worktree is initialized
-        seat_wt = WORKTREES_DIR / engine
+        seat_wt = self.worktrees_dir / engine
         if not seat_wt.exists():
-            run_gate("init-seat", engine)
+            self.run_gate("init-seat", engine)
 
         # Bind seat to task branch for implementer role requiring writable branch mutations
         if role == "implementer":
-            status_res = run_gate("status", task_id)
+            status_res = self.run_gate("status", task_id)
             if status_res.stdout.strip() != "ACTIVE":
-                assign_res = run_gate("assign", task_id, engine)
+                assign_res = self.run_gate("assign", task_id, engine)
                 if assign_res.returncode != 0:
                     raise RuntimeError(f"Worktree assign failed: {assign_res.stderr}")
 
@@ -198,12 +205,12 @@ class OrchestrationEngine:
         verify_cmd = " && ".join(task.verification_commands)
         task.transition(TaskState.MERGING, reason="Acquiring merge lock and running verification gate")
 
-        gate_res = run_gate("review", task_id, seat, verify_cmd)
+        gate_res = self.run_gate("review", task_id, seat, verify_cmd)
         if gate_res.returncode == 0:
             # Capture merge commit
             int_rev = subprocess.run(
                 ["git", "rev-parse", "integration"],
-                cwd=REPO_ROOT,
+                cwd=str(self.target_repo),
                 capture_output=True,
                 text=True,
             )
@@ -218,7 +225,7 @@ class OrchestrationEngine:
             )
 
             # Release seat
-            run_gate("release", task_id, seat)
+            self.run_gate("release", task_id, seat)
             self.store.save_task(task)
             return True
         else:

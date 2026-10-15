@@ -307,18 +307,18 @@ class TaskService:
             self._worker_events[task_id] = wait_event
 
         deadline = time.time() + timeout_sec
-        answered = False
         while time.time() < deadline:
             if self._cancellation_flags.get(task_id):
                 raise BridgeError(f"Task {task_id} was cancelled while awaiting answer.")
 
-            if wait_event.wait(timeout=1.0):
-                # Check if answered
-                q_rec = self.store.get_question(qid)
-                if q_rec and q_rec["status"] == "ANSWERED":
-                    # Transition back to ACTIVE
-                    self.store.update_bridge_task_state(task_id, TaskState.ACTIVE.value)
-                    return q_rec["answer_text"] or ""
+            q_rec = self.store.get_question(qid)
+            if q_rec and q_rec["status"] == "ANSWERED":
+                self.store.update_bridge_task_state(task_id, TaskState.ACTIVE.value)
+                return q_rec["answer_text"] or ""
+            elif q_rec and q_rec["status"] == "CANCELLED":
+                raise BridgeError(f"Question {qid} was cancelled.")
+
+            wait_event.wait(timeout=0.5)
 
         # Timeout expired
         self.store.update_bridge_task_state(
@@ -336,7 +336,7 @@ class TaskService:
                 engine = self.engine_factory()
             else:
                 from orchestrator.engine import OrchestrationEngine
-                engine = OrchestrationEngine()
+                engine = OrchestrationEngine(target_repo=spec.repo)
 
             # Execute via engine if available
             if hasattr(engine, "execute_bridge_task"):

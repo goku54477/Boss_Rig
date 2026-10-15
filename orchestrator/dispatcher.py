@@ -158,15 +158,16 @@ class SeatBridgeProcess:
 class TaskDispatcher:
     """Dispatches tasks to the appropriate engine seat."""
 
-    def __init__(self, store: Optional[Any] = None) -> None:
+    def __init__(self, store: Optional[Any] = None, worktrees_dir: Optional[Path] = None) -> None:
         self.active_bridges: Dict[str, SeatBridgeProcess] = {}
         self.store = store
+        self.worktrees_dir = Path(worktrees_dir or WORKTREES_DIR).resolve()
 
     def get_or_start_bridge(self, engine: str) -> SeatBridgeProcess:
         if engine in self.active_bridges and self.active_bridges[engine].is_alive():
             return self.active_bridges[engine]
 
-        seat_wt = WORKTREES_DIR / engine
+        seat_wt = self.worktrees_dir / engine
         if not seat_wt.exists():
             seat_wt.mkdir(parents=True, exist_ok=True)
 

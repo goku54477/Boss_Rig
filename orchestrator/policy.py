@@ -76,6 +76,8 @@ class PolicyEngine:
     ALLOWED_REPOSITORIES: List[Path] = [
         Path(r"c:\Users\jacob\Boss Agent"),
         Path("/mnt/c/Users/jacob/Boss Agent"),
+        Path(r"c:\Users\jacob\Boss Agent\.disposable-live-repo"),
+        Path("/mnt/c/Users/jacob/Boss Agent/.disposable-live-repo"),
     ]
 
     @classmethod
