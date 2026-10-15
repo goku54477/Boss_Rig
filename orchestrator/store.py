@@ -573,6 +573,55 @@ class TaskStore:
         except sqlite3.Error:
             return False
 
+    def get_processed_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM bridge_processed_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "event_id": row["event_id"],
+                "chat_id": row["chat_id"],
+                "message_created_at": row["message_created_at"],
+                "spec_id": row["spec_id"],
+                "repo_path": row["repo_path"],
+                "task_id": row["task_id"],
+                "action": row["action"],
+                "status": row["status"],
+                "detail": row["detail"],
+                "processed_at": row["processed_at"],
+            }
+
+    def update_processed_event(
+        self,
+        event_id: str,
+        status: str,
+        task_id: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE bridge_processed_events
+                SET status = ?, task_id = COALESCE(?, task_id), detail = COALESCE(?, detail), processed_at = ?
+                WHERE event_id = ?
+                """,
+                (status, task_id, detail, now, event_id),
+            )
+
+    def get_bridge_task_by_idempotency(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT task_id FROM bridge_tasks WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if not row:
+                return None
+            return self.get_bridge_task(row["task_id"])
+
     def is_event_claimed(self, event_id: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(

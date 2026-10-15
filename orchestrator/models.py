@@ -202,3 +202,28 @@ class UserQuestion:
     created_at: float = field(default_factory=time.time)
     answered_at: Optional[float] = None
 
+
+@dataclass
+class ApprovalRecord:
+    spec_id: str
+    repo: str
+    source: str  # "goldfish_chat", "operator_cli"
+    conversation_id: Optional[str] = None
+    message_id: Optional[str] = None
+    approval_token: Optional[str] = None
+    approved_by: str = "user"
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "spec_id": self.spec_id,
+            "repo": self.repo,
+            "source": self.source,
+            "conversation_id": self.conversation_id,
+            "message_id": self.message_id,
+            "approval_token": self.approval_token,
+            "approved_by": self.approved_by,
+            "timestamp": self.timestamp,
+        }
+
+

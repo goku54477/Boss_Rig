@@ -32,8 +32,9 @@ from typing import Any, Dict, List, Optional
 
 from orchestrator.chat_watcher import ChatWatcher
 from orchestrator.event_emitter import EventEmitter
-from orchestrator.models import TaskSpec, TaskState, compute_spec_hash
+from orchestrator.models import ApprovalRecord, TaskSpec, TaskState, compute_spec_hash
 from orchestrator.policy import PolicyEngine, PolicyViolation
+from orchestrator.security import is_pid_alive, kill_process_tree
 from orchestrator.server import TaskServer
 from orchestrator.store import TaskStore
 from orchestrator.task_service import (
@@ -176,6 +177,14 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             allowed_merge_target="integration",
         )
 
+    def _create_operator_approval(self, spec: TaskSpec) -> ApprovalRecord:
+        return ApprovalRecord(
+            spec_id=spec.compute_hash(),
+            repo=spec.repo,
+            source="operator_cli",
+            approved_by="operator",
+        )
+
     # --- Test 1: Full pipeline pass ---
     def test_01_full_pipeline_success(self) -> None:
         """1. Approved spec -> queued -> planner -> implementer -> reviewer -> candidate tests -> merged-tree tests -> integration commit."""
@@ -195,6 +204,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             idempotency_key="test-key-1",
             approved=True,
             approved_hash=spec_hash,
+            approval_record=self._create_operator_approval(spec),
         )
         task_id = res["task_id"]
 
@@ -229,7 +239,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         before_head = subprocess.check_output(["git", "rev-parse", "integration"], cwd=self.repo_dir, text=True).strip()
 
         spec = self._create_sample_spec()
-        res = service.task_submit(spec=spec, idempotency_key="test-key-2", approved=True, approved_hash=spec.compute_hash())
+        res = service.task_submit(
+            spec=spec,
+            idempotency_key="test-key-2",
+            approved=True,
+            approved_hash=spec.compute_hash(),
+            approval_record=self._create_operator_approval(spec),
+        )
         time.sleep(0.5)
 
         status = service.task_status(res["task_id"])
@@ -252,7 +268,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         before_head = subprocess.check_output(["git", "rev-parse", "integration"], cwd=self.repo_dir, text=True).strip()
 
         spec = self._create_sample_spec()
-        res = service.task_submit(spec=spec, idempotency_key="test-key-3", approved=True, approved_hash=spec.compute_hash())
+        res = service.task_submit(
+            spec=spec,
+            idempotency_key="test-key-3",
+            approved=True,
+            approved_hash=spec.compute_hash(),
+            approval_record=self._create_operator_approval(spec),
+        )
         time.sleep(0.5)
 
         status = service.task_status(res["task_id"])
@@ -269,15 +291,31 @@ class TestBossRigBridgeE2E(unittest.TestCase):
 
         # Unapproved
         with self.assertRaises(ApprovalVerificationError):
-            service.task_submit(spec=spec, idempotency_key="unappr", approved=False)
+            service.task_submit(
+                spec=spec,
+                idempotency_key="unappr",
+                approved=False,
+                approval_record=self._create_operator_approval(spec),
+            )
 
-        # Hash mismatch
+        # Hash mismatch in approved_hash
         with self.assertRaises(ApprovalVerificationError):
             service.task_submit(
                 spec=spec,
                 idempotency_key="tampered",
                 approved=True,
                 approved_hash="sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                approval_record=self._create_operator_approval(spec),
+            )
+
+        # Self-asserted approval without approval record is rejected
+        with self.assertRaises(ApprovalVerificationError):
+            service.task_submit(
+                spec=spec,
+                idempotency_key="self-asserted",
+                approved=True,
+                approved_hash=spec.compute_hash(),
+                approval_record=None,
             )
 
     # --- Test 5: Assistant messages and pasted examples cannot dispatch ---
@@ -367,8 +405,20 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         spec = self._create_sample_spec()
         spec_hash = spec.compute_hash()
 
-        res1 = service.task_submit(spec=spec, idempotency_key="idem-key-1", approved=True, approved_hash=spec_hash)
-        res2 = service.task_submit(spec=spec, idempotency_key="idem-key-1", approved=True, approved_hash=spec_hash)
+        res1 = service.task_submit(
+            spec=spec,
+            idempotency_key="idem-key-1",
+            approved=True,
+            approved_hash=spec_hash,
+            approval_record=self._create_operator_approval(spec),
+        )
+        res2 = service.task_submit(
+            spec=spec,
+            idempotency_key="idem-key-1",
+            approved=True,
+            approved_hash=spec_hash,
+            approval_record=self._create_operator_approval(spec),
+        )
 
         self.assertEqual(res1["task_id"], res2["task_id"])
         self.assertTrue(res1["is_new"])
@@ -377,19 +427,62 @@ class TestBossRigBridgeE2E(unittest.TestCase):
 
     # --- Test 8: Restart between claim and dispatch recovers safely ---
     def test_08_restart_recovery(self) -> None:
-        """8. Restart between claim and dispatch recovers safely."""
-        # Pre-claim message in store
+        """8. Restart between claim and dispatch recovers safely without losing or duplicating tasks."""
+        spec = self._create_sample_spec()
+        spec_hash = spec.compute_hash()
+        spec_json = json.dumps(spec.to_canonical_dict())
+
+        # Create chat transcript with proposed spec and user approval
+        chat_data = {
+            "id": "chat-crash-recovery",
+            "messages": [
+                {"id": "msg-prop-1", "role": "assistant", "content": f"```boss-rig-spec\n{spec_json}\n```"},
+                {"id": "msg-appr-1", "role": "user", "content": f"@boss-rig approve spec_id={spec_hash}"},
+            ],
+        }
+        chat_file = self.chats_dir / "crash_chat.json"
+        chat_file.write_text(json.dumps(chat_data), encoding="utf-8")
+
+        # Simulate crash: message was claimed in store with status 'CLAIMED' before submission completed
         self.store.claim_event_durable(
-            event_id="msg-claim-1",
-            chat_id="chat-1",
+            event_id="msg-appr-1",
+            chat_id="chat-crash-recovery",
+            spec_id=spec_hash,
+            repo_path=spec.repo,
             action="APPROVE",
             status="CLAIMED",
         )
-        self.assertTrue(self.store.is_event_claimed("msg-claim-1"))
+        self.assertTrue(self.store.is_event_claimed("msg-appr-1"))
+        self.assertIsNone(self.store.get_bridge_task_by_idempotency("chat-chat-crash-recovery-msg-appr-1"))
 
-        # Re-initialize service and watcher (simulating process restart)
-        new_store = TaskStore(db_path=self.db_path)
-        self.assertTrue(new_store.is_event_claimed("msg-claim-1"))
+        # Re-initialize service and watcher (simulating restart after crash)
+        mock_engine = MockEngine()
+        service = TaskService(
+            store=self.store,
+            event_emitter=self.emitter,
+            engine_factory=lambda: mock_engine,
+            extra_allowed_repos=[self.repo_dir],
+            dry_run=False,
+        )
+        watcher = ChatWatcher(service=service, chats_dir=self.chats_dir, dry_run=False)
+
+        # First scan recovers the interrupted claim and submits the task
+        results = watcher.scan_once()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "SUBMITTED")
+
+        # Verify task was submitted and event status updated to SUBMITTED
+        task_rec = self.store.get_bridge_task_by_idempotency("chat-chat-crash-recovery-msg-appr-1")
+        self.assertIsNotNone(task_rec)
+        evt = self.store.get_processed_event("msg-appr-1")
+        self.assertEqual(evt["status"], "SUBMITTED")
+
+        # Second scan must NOT execute it twice
+        results_again = watcher.scan_once()
+        self.assertEqual(len(results_again), 0)
+        time.sleep(0.4)
+        tasks = self.store.list_bridge_tasks()
+        self.assertEqual(len(tasks), 1)
 
     # --- Test 9: Disallowed repositories / main targets are rejected ---
     def test_09_disallowed_repos_and_main_target_rejected(self) -> None:
@@ -403,7 +496,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             verification_commands=["true"],
         )
         with self.assertRaises(PolicyViolation):
-            service.task_submit(spec=bad_repo_spec, idempotency_key="bad-repo", approved=True, approved_hash=bad_repo_spec.compute_hash())
+            service.task_submit(
+                spec=bad_repo_spec,
+                idempotency_key="bad-repo",
+                approved=True,
+                approved_hash=bad_repo_spec.compute_hash(),
+                approval_record=self._create_operator_approval(bad_repo_spec),
+            )
 
         # 2. Disallowed merge target (main)
         bad_target_spec = TaskSpec(
@@ -413,7 +512,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             allowed_merge_target="main",
         )
         with self.assertRaises(PolicyViolation):
-            service.task_submit(spec=bad_target_spec, idempotency_key="bad-target", approved=True, approved_hash=bad_target_spec.compute_hash())
+            service.task_submit(
+                spec=bad_target_spec,
+                idempotency_key="bad-target",
+                approved=True,
+                approved_hash=bad_target_spec.compute_hash(),
+                approval_record=self._create_operator_approval(bad_target_spec),
+            )
 
     # --- Test 10: Pending question -> valid answer -> safe resume ---
     def test_10_question_and_answer_resumes_execution(self) -> None:
@@ -427,7 +532,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         )
 
         spec = self._create_sample_spec()
-        res = service.task_submit(spec=spec, idempotency_key="q-task-1", approved=True, approved_hash=spec.compute_hash())
+        res = service.task_submit(
+            spec=spec,
+            idempotency_key="q-task-1",
+            approved=True,
+            approved_hash=spec.compute_hash(),
+            approval_record=self._create_operator_approval(spec),
+        )
         task_id = res["task_id"]
 
         # Wait for task to pause on question
@@ -453,7 +564,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         mock_engine = MockEngine(trigger_question_prompt="Choose mode: A or B?")
         service = TaskService(store=self.store, event_emitter=self.emitter, engine_factory=lambda: mock_engine, extra_allowed_repos=[self.repo_dir])
         spec = self._create_sample_spec()
-        res = service.task_submit(spec=spec, idempotency_key="q-task-2", approved=True, approved_hash=spec.compute_hash())
+        res = service.task_submit(
+            spec=spec,
+            idempotency_key="q-task-2",
+            approved=True,
+            approved_hash=spec.compute_hash(),
+            approval_record=self._create_operator_approval(spec),
+        )
         time.sleep(0.3)
 
         questions = service.task_questions(task_id=res["task_id"], status="PENDING")
@@ -473,7 +590,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         mock_engine = MockEngine(trigger_question_prompt="Waiting indefinitely...")
         service = TaskService(store=self.store, event_emitter=self.emitter, engine_factory=lambda: mock_engine, extra_allowed_repos=[self.repo_dir])
         spec = self._create_sample_spec()
-        res = service.task_submit(spec=spec, idempotency_key="cancel-task-1", approved=True, approved_hash=spec.compute_hash())
+        res = service.task_submit(
+            spec=spec,
+            idempotency_key="cancel-task-1",
+            approved=True,
+            approved_hash=spec.compute_hash(),
+            approval_record=self._create_operator_approval(spec),
+        )
         task_id = res["task_id"]
         time.sleep(0.3)
 
@@ -496,7 +619,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         mock_engine = MockEngine()
         service = TaskService(store=self.store, event_emitter=self.emitter, engine_factory=lambda: mock_engine, extra_allowed_repos=[self.repo_dir])
 
-        res = service.task_submit(spec=spec, idempotency_key="codex-reject", approved=True, approved_hash=spec.compute_hash())
+        res = service.task_submit(
+            spec=spec,
+            idempotency_key="codex-reject",
+            approved=True,
+            approved_hash=spec.compute_hash(),
+            approval_record=self._create_operator_approval(spec),
+        )
         time.sleep(0.4)
 
         status = service.task_status(res["task_id"])
@@ -518,7 +647,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         before_head = subprocess.check_output(["git", "rev-parse", "integration"], cwd=self.repo_dir, text=True).strip()
 
         spec = self._create_sample_spec()
-        res = service.task_submit(spec=spec, idempotency_key="dry-run-key", approved=True, approved_hash=spec.compute_hash())
+        res = service.task_submit(
+            spec=spec,
+            idempotency_key="dry-run-key",
+            approved=True,
+            approved_hash=spec.compute_hash(),
+            approval_record=self._create_operator_approval(spec),
+        )
         self.assertEqual(res["status"], "DRY_RUN")
 
         time.sleep(0.3)
@@ -569,6 +704,115 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         self.assertEqual(chat_file.read_text(encoding="utf-8"), chat_content)
         self.assertEqual(inbox_file.stat().st_mtime, inbox_mtime_before)
         self.assertEqual(chat_file.stat().st_mtime, chat_mtime_before)
+
+    # --- Test 16: Trusted approval enforcement ---
+    def test_16_trusted_approval_enforcement(self) -> None:
+        """16. Verify approval enforcement rejecting tampered or unverified approvals."""
+        service = TaskService(store=self.store, event_emitter=self.emitter, extra_allowed_repos=[self.repo_dir])
+        spec = self._create_sample_spec()
+        spec_hash = spec.compute_hash()
+
+        # 1. Self-asserted approval rejected
+        with self.assertRaises(ApprovalVerificationError):
+            service.task_submit(
+                spec=spec,
+                idempotency_key="key-self",
+                approved=True,
+                approved_hash=spec_hash,
+                approval_record=None,
+            )
+
+        # 2. Spec hash mismatch in approval record rejected
+        with self.assertRaises(ApprovalVerificationError):
+            service.task_submit(
+                spec=spec,
+                idempotency_key="key-mismatch-hash",
+                approved=True,
+                approved_hash=spec_hash,
+                approval_record=ApprovalRecord(
+                    spec_id="sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    repo=spec.repo,
+                    source="operator_cli",
+                ),
+            )
+
+        # 3. Repository mismatch in approval record rejected
+        with self.assertRaises(ApprovalVerificationError):
+            service.task_submit(
+                spec=spec,
+                idempotency_key="key-mismatch-repo",
+                approved=True,
+                approved_hash=spec_hash,
+                approval_record=ApprovalRecord(
+                    spec_id=spec_hash,
+                    repo="c:\\different\\path",
+                    source="operator_cli",
+                ),
+            )
+
+        # 4. Chat approval with unverified message ID rejected
+        with self.assertRaises(ApprovalVerificationError):
+            service.task_submit(
+                spec=spec,
+                idempotency_key="key-unverified-chat",
+                approved=True,
+                approved_hash=spec_hash,
+                approval_record=ApprovalRecord(
+                    spec_id=spec_hash,
+                    repo=spec.repo,
+                    source="goldfish_chat",
+                    conversation_id="chat-1",
+                    message_id="unclaimed-fake-msg-id",
+                ),
+            )
+
+    # --- Test 17: Real child process tree termination on cancellation ---
+    def test_17_real_subprocess_tree_cancellation(self) -> None:
+        """17. Verify cancellation actually terminates the process tree and releases resources."""
+        import sys
+        service = TaskService(store=self.store, event_emitter=self.emitter, extra_allowed_repos=[self.repo_dir])
+        spec = self._create_sample_spec()
+        spec_hash = spec.compute_hash()
+
+        # Submit task
+        res = service.task_submit(
+            spec=spec,
+            idempotency_key="key-proc-kill",
+            approved=True,
+            approved_hash=spec_hash,
+            approval_record=self._create_operator_approval(spec),
+        )
+        task_id = res["task_id"]
+
+        # Launch a harmless local child process simulating an active seat runner
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            pid = proc.pid
+            service.register_task_pid(task_id, pid)
+            self.assertTrue(is_pid_alive(pid), "Subprocess should be alive initially")
+
+            # Cancel task
+            cancelled = service.task_cancel(task_id, reason="Testing process tree kill")
+            self.assertTrue(cancelled)
+
+            # Wait up to 3s for process termination
+            deadline = time.time() + 3.0
+            dead = False
+            while time.time() < deadline:
+                if not is_pid_alive(pid):
+                    dead = True
+                    break
+                time.sleep(0.1)
+
+            self.assertTrue(dead, f"Process {pid} should have been terminated by task_cancel")
+            self.assertEqual(service.task_status(task_id)["state"], "CANCELLED")
+        finally:
+            if is_pid_alive(proc.pid):
+                kill_process_tree(proc.pid)
 
 
 if __name__ == "__main__":

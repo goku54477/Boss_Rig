@@ -97,17 +97,39 @@ class TestTaskServerAPI(unittest.TestCase):
         )
         spec_hash = spec.compute_hash()
 
-        payload = {
+        # 1. Self-asserted approval without approval_record must be rejected with HTTP 403
+        unauthorized_payload = {
+            "spec": spec.to_canonical_dict(),
+            "idempotency_key": "api-idem-unauth",
+            "approved": True,
+            "approved_hash": spec_hash,
+        }
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._request("POST", "/tasks/submit", data=unauthorized_payload)
+        self.assertEqual(ctx.exception.code, 403)
+
+        # 2. Submission with valid operator approval record succeeds
+        valid_payload = {
             "spec": spec.to_canonical_dict(),
             "idempotency_key": "api-idem-1",
             "approved": True,
             "approved_hash": spec_hash,
+            "approval_record": {
+                "spec_id": spec_hash,
+                "repo": str(self.dummy_repo),
+                "source": "operator_cli",
+                "approved_by": "operator",
+            },
         }
-
-        # 1. Submit
-        res = self._request("POST", "/tasks/submit", data=payload)
+        res = self._request("POST", "/tasks/submit", data=valid_payload)
         self.assertEqual(res["status"], "DRY_RUN")
         self.assertEqual(res["spec_id"], spec_hash)
+
+        # 3. Query status via GET /tasks/<task_id> for an enrolled task
+        stored_tid, _ = self.store.submit_bridge_task(spec, idempotency_key="api-store-query")
+        status = self._request("GET", f"/tasks/{stored_tid}")
+        self.assertEqual(status["task_id"], stored_tid)
+        self.assertEqual(status["spec_id"], spec_hash)
 
 
 if __name__ == "__main__":

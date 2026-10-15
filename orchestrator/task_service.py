@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from orchestrator.event_emitter import EventEmitter
-from orchestrator.models import TaskRecord, TaskSpec, TaskState, UserQuestion
+from orchestrator.models import ApprovalRecord, TaskRecord, TaskSpec, TaskState, UserQuestion
 from orchestrator.policy import PolicyEngine, PolicyViolation
+from orchestrator.security import is_pid_alive, kill_process_tree, normalize_repo_path
 from orchestrator.store import TaskStore
 
 
@@ -51,6 +52,7 @@ class TaskService:
         self._active_workers: Dict[str, threading.Thread] = {}
         self._worker_events: Dict[str, threading.Event] = {}  # for question wait/wake
         self._cancellation_flags: Dict[str, bool] = {}
+        self._task_pids: Dict[str, List[int]] = {}
         self._lock = threading.Lock()
 
     def task_submit(
@@ -60,6 +62,7 @@ class TaskService:
         approved: bool = True,
         approved_hash: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        approval_record: Optional[ApprovalRecord | Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Submit a task for asynchronous execution with strict approval validation."""
         # 1. Enforce repository allowlist
@@ -81,6 +84,35 @@ class TaskService:
             raise ApprovalVerificationError(
                 f"Approval hash mismatch: approved '{approved_hash}' does not match computed spec hash '{computed_hash}'."
             )
+
+        if approval_record is None:
+            raise ApprovalVerificationError(
+                "Self-asserted approval rejected: explicit trusted approval record (from verified user chat event or operator signature) is required."
+            )
+
+        if isinstance(approval_record, dict):
+            approval_record = ApprovalRecord(**approval_record)
+
+        if approval_record.spec_id.lower() != computed_hash.lower():
+            raise ApprovalVerificationError(
+                f"Approval record hash '{approval_record.spec_id}' does not match computed spec hash '{computed_hash}'."
+            )
+
+        if normalize_repo_path(approval_record.repo) != normalize_repo_path(spec.repo):
+            raise ApprovalVerificationError(
+                f"Approval record repo '{approval_record.repo}' does not match spec repo '{spec.repo}'."
+            )
+
+        if approval_record.source == "goldfish_chat":
+            if not approval_record.message_id or not self.store.is_event_claimed(approval_record.message_id):
+                raise ApprovalVerificationError(
+                    f"Approval message '{approval_record.message_id}' was not verified in chat transcripts."
+                )
+        elif approval_record.source != "operator_cli":
+            raise ApprovalVerificationError(
+                f"Unknown approval source '{approval_record.source}'. Must be 'goldfish_chat' or 'operator_cli'."
+            )
+
 
         # 5. Check dry-run mode
         if self.dry_run:
@@ -169,20 +201,37 @@ class TaskService:
         """List tasks with optional state filtering."""
         return self.store.list_bridge_tasks(limit=limit, state=state)
 
+    def register_task_pid(self, task_id: str, pid: int) -> None:
+        """Register child process PID associated with task for clean process-tree cancellation."""
+        with self._lock:
+            if task_id not in self._task_pids:
+                self._task_pids[task_id] = []
+            if pid not in self._task_pids[task_id]:
+                self._task_pids[task_id].append(pid)
+
+    def get_task_pids(self, task_id: str) -> List[int]:
+        with self._lock:
+            return list(self._task_pids.get(task_id, []))
+
     def task_cancel(self, task_id: str, reason: str = "") -> bool:
-        """Cancel an in-flight or queued task safely."""
+        """Cancel an in-flight or queued task safely and forcefully terminate its process tree."""
         with self._lock:
             self._cancellation_flags[task_id] = True
+            pids = list(self._task_pids.get(task_id, []))
             # Wake up any thread waiting on a question
             if task_id in self._worker_events:
                 self._worker_events[task_id].set()
+
+        # Forcefully terminate any active child process trees
+        for pid in pids:
+            kill_process_tree(pid)
 
         cancelled = self.store.cancel_task(task_id, reason=reason)
         if cancelled:
             self.emitter.emit(
                 "TASK_CANCELLED",
                 task_id=task_id,
-                data={"reason": reason},
+                data={"reason": reason, "killed_pids": pids},
                 notification_title="[Boss Rig] Task Cancelled",
                 notification_body=f"Task {task_id} was cancelled: {reason}",
             )
@@ -373,6 +422,25 @@ class TaskService:
                 self._active_workers.pop(task_id, None)
                 self._worker_events.pop(task_id, None)
                 self._cancellation_flags.pop(task_id, None)
+                self._task_pids.pop(task_id, None)
+
+    def recover_inflight_tasks(self) -> List[str]:
+        """On orchestrator startup, safely mark orphaned in-flight tasks from previous run as BLOCKED."""
+        orphaned = []
+        with self.store._connect() as conn:
+            rows = conn.execute(
+                "SELECT task_id, state FROM bridge_tasks WHERE state IN ('ACTIVE', 'QUEUED')"
+            ).fetchall()
+            for r in rows:
+                tid = r["task_id"]
+                if tid not in self._active_workers:
+                    self.store.update_bridge_task_state(
+                        tid,
+                        TaskState.BLOCKED.value,
+                        error="Orchestrator restarted while task was in-flight; requiring operator verification",
+                    )
+                    orphaned.append(tid)
+        return orphaned
 
     def wait_all(self, timeout_sec: float = 5.0) -> None:
         """Wait for all active background workers to finish (useful in tests and shutdown)."""

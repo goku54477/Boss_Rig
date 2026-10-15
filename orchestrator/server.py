@@ -156,6 +156,7 @@ class TaskServiceHandler(BaseHTTPRequestHandler):
                 approved = bool(body.get("approved", True))
                 approved_hash = body.get("approved_hash")
                 conversation_id = body.get("conversation_id")
+                raw_approval = body.get("approval_record")
 
                 res = self.service.task_submit(
                     spec=spec,
@@ -163,6 +164,7 @@ class TaskServiceHandler(BaseHTTPRequestHandler):
                     approved=approved,
                     approved_hash=approved_hash,
                     conversation_id=conversation_id,
+                    approval_record=raw_approval,
                 )
                 self._send_json(201 if res.get("is_new") else 200, res)
 

@@ -172,11 +172,13 @@ class McpServer:
                     allowed_merge_target=args.get("allowed_merge_target", "integration"),
                 )
                 idempotency_key = args.get("idempotency_key") or spec.compute_hash()
+                raw_approval = args.get("approval_record")
                 res = self.service.task_submit(
                     spec=spec,
                     idempotency_key=idempotency_key,
                     approved=args.get("approved", True),
                     approved_hash=args.get("approved_hash"),
+                    approval_record=raw_approval,
                 )
                 content = json.dumps(res, indent=2)
 

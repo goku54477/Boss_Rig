@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from orchestrator.models import TaskSpec, compute_spec_hash
+from orchestrator.models import ApprovalRecord, TaskSpec, compute_spec_hash
 from orchestrator.policy import PolicyEngine, PolicyViolation
 from orchestrator.task_service import TaskService
 
@@ -166,7 +166,16 @@ class ChatWatcher:
 
             # Check if message already claimed
             if self.service.store.is_event_claimed(msg_id):
-                continue
+                evt = self.service.store.get_processed_event(msg_id)
+                if evt and evt.get("status") == "CLAIMED":
+                    idempotency_key = f"chat-{chat_id}-{msg_id}"
+                    if not self.service.store.get_bridge_task_by_idempotency(idempotency_key):
+                        # Interrupted crash recovery: proceed to handle and dispatch
+                        pass
+                    else:
+                        continue
+                else:
+                    continue
 
             content = msg.get("content", "")
             sanitized = strip_quotes_and_codeblocks(content)
@@ -298,7 +307,15 @@ class ChatWatcher:
             spec_id=expected_hash,
             repo_path=spec.repo,
             action="APPROVE",
-            status="SUBMITTED",
+            status="CLAIMED",
+        )
+        approval_rec = ApprovalRecord(
+            spec_id=expected_hash,
+            repo=spec.repo,
+            source="goldfish_chat",
+            conversation_id=chat_id,
+            message_id=msg_id,
+            timestamp=created_at / 1000.0 if created_at else time.time(),
         )
         submit_res = self.service.task_submit(
             spec=spec,
@@ -306,7 +323,10 @@ class ChatWatcher:
             approved=True,
             approved_hash=expected_hash,
             conversation_id=chat_id,
+            approval_record=approval_rec,
         )
+        task_id = submit_res.get("task_id")
+        self.service.store.update_processed_event(msg_id, status="SUBMITTED", task_id=task_id)
         return {"message_id": msg_id, "status": "SUBMITTED", "result": submit_res}
 
     def _handle_answer(
