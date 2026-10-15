@@ -79,13 +79,17 @@ class ChatWatcher:
         chats_dir: Optional[Path] = None,
         dry_run: bool = True,
         poll_interval_sec: float = 0.5,
+        auto_baseline: bool = True,
     ):
         self.service = service
         self.chats_dir = chats_dir or resolve_goldfish_chats_dir()
         self.dry_run = dry_run
         self.poll_interval_sec = poll_interval_sec
+        self.auto_baseline = auto_baseline
         self._running = False
         self._baselined = False
+        if self.auto_baseline:
+            self.baseline_existing_messages()
 
     def baseline_existing_messages(self) -> int:
         """Record all existing chat messages as baseline so they are never executed."""

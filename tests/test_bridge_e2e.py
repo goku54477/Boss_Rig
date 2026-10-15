@@ -388,9 +388,9 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         service = TaskService(store=self.store, event_emitter=self.emitter, engine_factory=lambda: mock_engine, extra_allowed_repos=[self.repo_dir])
         watcher = ChatWatcher(service=service, chats_dir=self.chats_dir, dry_run=False)
 
-        # Baseline on startup
-        baselined = watcher.baseline_existing_messages()
-        self.assertEqual(baselined, 2)
+        # Automatically baselined on startup
+        self.assertTrue(self.store.is_event_claimed("pre-1"))
+        self.assertTrue(self.store.is_event_claimed("pre-2"))
 
         # Scan should now find 0 new actionable messages
         results = watcher.scan_once()

@@ -15,20 +15,32 @@ from orchestrator.server import TaskServer, get_or_create_auth_token
 from orchestrator.task_service import TaskService
 
 
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     service = TaskService(dry_run=args.dry_run)
     server = TaskServer(service=service, host=args.host, port=args.port)
-    print(f"🚀 Starting Boss Rig Task Server on http://{args.host}:{server.port}")
-    print(f"🔑 Auth Token: {server.auth_token}")
+    print(f"[START] Starting Boss Rig Task Server on http://{args.host}:{server.port}")
+    print(f"[AUTH] Bearer Token: {server.auth_token}")
     print("Press Ctrl+C to terminate.")
     server.start()
     try:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down Task Server...")
+        print("\n[STOP] Shutting down Task Server...")
         server.stop()
-        print("✓ Server stopped cleanly.")
+        print("[OK] Server stopped cleanly.")
         return 0
 
 
@@ -36,20 +48,20 @@ def cmd_watch(args: argparse.Namespace) -> int:
     dry_run = not args.live
     chats_dir = Path(args.chats_dir) if args.chats_dir else resolve_goldfish_chats_dir()
 
-    print("🔍 Initializing Goldfish Chat Watcher...")
-    print(f"   Directory: {chats_dir}")
-    print(f"   Mode: {'[DRY RUN] (No agents launched)' if dry_run else '[LIVE EXECUTION]'}")
+    print("[INIT] Initializing Goldfish Chat Watcher...", flush=True)
+    print(f"   Directory: {chats_dir}", flush=True)
+    print(f"   Mode: {'[DRY RUN] (No agents launched)' if dry_run else '[LIVE EXECUTION]'}", flush=True)
 
     if not chats_dir or not chats_dir.exists():
-        print(f"❌ Error: Goldfish chats directory not found: {chats_dir}")
+        print(f"[ERROR] Goldfish chats directory not found: {chats_dir}", flush=True)
         return 1
 
     service = TaskService(dry_run=dry_run)
     watcher = ChatWatcher(service=service, chats_dir=chats_dir, dry_run=dry_run, poll_interval_sec=args.interval)
 
     baselined = watcher.baseline_existing_messages()
-    print(f"   ✓ Baselined {baselined} historical messages (will not be executed).")
-    print("📡 Watching for @boss-rig commands in active transcripts... (Press Ctrl+C to stop)")
+    print(f"   [OK] Baselined {baselined} historical messages (will not be executed).", flush=True)
+    print("[WATCHING] Watching for @boss-rig commands in active transcripts... (Press Ctrl+C to stop)", flush=True)
 
     try:
         while True:
@@ -58,18 +70,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 status = r.get("status")
                 msg_id = r.get("message_id")
                 if status == "WOULD_SUBMIT":
-                    print(f"\n[DRY RUN] Would submit task for spec {r.get('spec_id')}:")
-                    print(f"   Goal: {r.get('goal')}")
-                    print(f"   Repo: {r.get('repo')}")
+                    print(f"\n[DRY RUN] Would submit task for spec {r.get('spec_id')}:", flush=True)
+                    print(f"   Goal: {r.get('goal')}", flush=True)
+                    print(f"   Repo: {r.get('repo')}", flush=True)
                 elif status == "SUBMITTED":
-                    print(f"\n[LIVE] Dispatched task {r.get('result', {}).get('task_id')} for message {msg_id}")
+                    print(f"\n[LIVE] Dispatched task {r.get('result', {}).get('task_id')} for message {msg_id}", flush=True)
                 elif status == "REJECTED":
-                    print(f"\n[REJECTED] Message {msg_id} failed verification: {r.get('error')}")
+                    print(f"\n[REJECTED] Message {msg_id} failed verification: {r.get('error')}", flush=True)
                 elif status == "ANSWER_ACCEPTED":
-                    print(f"\n[ANSWER] Accepted answer for message {msg_id}")
+                    print(f"\n[ANSWER] Accepted answer for message {msg_id}", flush=True)
             time.sleep(args.interval)
     except KeyboardInterrupt:
-        print("\n🛑 Stopping Chat Watcher...")
+        print("\n[STOP] Stopping Chat Watcher...")
         return 0
 
 
