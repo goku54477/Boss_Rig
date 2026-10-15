@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import enum
+import hashlib
+import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +14,7 @@ class TaskState(str, enum.Enum):
     QUEUED = "QUEUED"
     ASSIGNED = "ASSIGNED"
     ACTIVE = "ACTIVE"
+    WAITING_FOR_USER = "WAITING_FOR_USER"
     REVIEW = "REVIEW"
     REVIEW_FAILED = "REVIEW_FAILED"
     REVIEW_CONFLICT = "REVIEW_CONFLICT"
@@ -95,6 +99,10 @@ class TaskRecord:
     max_attempts: int = 2
     context: Optional[Dict[str, Any]] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
+    spec_id: Optional[str] = None
+    repo: Optional[str] = None
+    allowed_merge_target: str = "integration"
+    questions: List[Dict[str, Any]] = field(default_factory=list)
 
     def transition(self, new_state: TaskState, reason: str = "", **metadata: Any) -> None:
         old_state = self.state
@@ -120,3 +128,77 @@ class BridgeEvent:
     status: str
     attempt: int
     data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TaskSpec:
+    repo: str
+    goal: str
+    verification_commands: List[str]
+    constraints: List[str] = field(default_factory=list)
+    acceptance_criteria: List[str] = field(default_factory=list)
+    allowed_merge_target: str = "integration"
+    timeout_sec: int = 1800
+    spec_version: int = 1
+    assigned_agents: Dict[str, str] = field(
+        default_factory=lambda: {
+            "planner": "antigravity-1",
+            "implementer": "opencode-1",
+            "reviewer": "antigravity-1",
+        }
+    )
+
+    def to_canonical_dict(self) -> Dict[str, Any]:
+        """Produce dictionary with sorted keys for deterministic hashing."""
+        return {
+            "acceptance_criteria": sorted(self.acceptance_criteria),
+            "allowed_merge_target": self.allowed_merge_target,
+            "assigned_agents": {k: self.assigned_agents[k] for k in sorted(self.assigned_agents)},
+            "constraints": sorted(self.constraints),
+            "goal": self.goal.strip(),
+            "repo": self.repo.strip(),
+            "spec_version": self.spec_version,
+            "timeout_sec": self.timeout_sec,
+            "verification_commands": self.verification_commands,
+        }
+
+    def compute_hash(self) -> str:
+        """Compute stable SHA-256 hash over canonical JSON representation."""
+        data = self.to_canonical_dict()
+        canonical_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+        return f"sha256:{digest}"
+
+
+def compute_spec_hash(data: Dict[str, Any]) -> str:
+    """Compute sha256:<hex> hash from a raw spec dict using canonical formatting."""
+    # Normalize dictionary fields
+    normalized = {
+        "acceptance_criteria": sorted(data.get("acceptance_criteria") or []),
+        "allowed_merge_target": data.get("allowed_merge_target", "integration"),
+        "assigned_agents": {
+            k: data.get("assigned_agents", {}).get(k, "")
+            for k in sorted(data.get("assigned_agents") or {"planner": "antigravity-1", "implementer": "opencode-1", "reviewer": "antigravity-1"})
+        },
+        "constraints": sorted(data.get("constraints") or []),
+        "goal": str(data.get("goal", "")).strip(),
+        "repo": str(data.get("repo", "")).strip(),
+        "spec_version": int(data.get("spec_version", 1)),
+        "timeout_sec": int(data.get("timeout_sec", 1800)),
+        "verification_commands": list(data.get("verification_commands") or []),
+    }
+    canonical_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return f"sha256:{hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()}"
+
+
+@dataclass
+class UserQuestion:
+    question_id: str
+    task_id: str
+    prompt: str
+    conversation_id: Optional[str] = None
+    status: str = "PENDING"  # PENDING, ANSWERED, EXPIRED, CANCELLED
+    answer_text: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+    answered_at: Optional[float] = None
+

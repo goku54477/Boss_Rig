@@ -104,6 +104,51 @@ class TaskStore:
                     held_by TEXT,
                     updated_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS bridge_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT UNIQUE,
+                    spec_id TEXT NOT NULL,
+                    repo TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    allowed_merge_target TEXT NOT NULL DEFAULT 'integration',
+                    spec_json TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'QUEUED',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS bridge_processed_events (
+                    event_id TEXT PRIMARY KEY,
+                    chat_id TEXT,
+                    message_created_at INTEGER,
+                    spec_id TEXT,
+                    repo_path TEXT,
+                    task_id TEXT,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    detail TEXT,
+                    processed_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS bridge_cursors (
+                    chat_id TEXT PRIMARY KEY,
+                    last_seen_created_at INTEGER NOT NULL,
+                    last_seen_message_id TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS bridge_user_questions (
+                    question_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    conversation_id TEXT,
+                    prompt TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    answer_text TEXT,
+                    created_at REAL NOT NULL,
+                    answered_at REAL
+                );
                 """
             )
 
@@ -382,3 +427,328 @@ class TaskStore:
                     "updated_at": row["updated_at"],
                 }
             return result
+
+    # --- Bridge & Service Methods ---
+
+    def submit_bridge_task(
+        self,
+        spec: Any,
+        idempotency_key: str,
+        task_id: Optional[str] = None,
+    ) -> Tuple[str, bool]:
+        """Atomically record task submission with idempotency key.
+        
+        Returns (task_id, created_new: bool).
+        """
+        now = time.time()
+        tid = task_id or f"T-RUN-{int(now * 1000)}"
+        spec_hash = spec.compute_hash() if hasattr(spec, "compute_hash") else spec.get("spec_id", "")
+        spec_json = json.dumps(spec.to_canonical_dict() if hasattr(spec, "to_canonical_dict") else spec)
+        repo = spec.repo if hasattr(spec, "repo") else spec.get("repo", "")
+        goal = spec.goal if hasattr(spec, "goal") else spec.get("goal", "")
+        merge_target = getattr(spec, "allowed_merge_target", "integration")
+
+        with self._connect() as conn:
+            # Check idempotency first
+            row = conn.execute(
+                "SELECT task_id, state FROM bridge_tasks WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row:
+                return row["task_id"], False
+
+            conn.execute(
+                """
+                INSERT INTO bridge_tasks (
+                    task_id, idempotency_key, spec_id, repo, goal,
+                    allowed_merge_target, spec_json, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?)
+                """,
+                (tid, idempotency_key, spec_hash, repo, goal, merge_target, spec_json, now, now),
+            )
+            return tid, True
+
+    def get_bridge_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM bridge_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "task_id": row["task_id"],
+                "idempotency_key": row["idempotency_key"],
+                "spec_id": row["spec_id"],
+                "repo": row["repo"],
+                "goal": row["goal"],
+                "allowed_merge_target": row["allowed_merge_target"],
+                "spec": json.loads(row["spec_json"]) if row["spec_json"] else {},
+                "state": row["state"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "error": row["error"],
+            }
+
+    def list_bridge_tasks(
+        self, limit: int = 50, state: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            if state:
+                rows = conn.execute(
+                    "SELECT * FROM bridge_tasks WHERE state = ? ORDER BY created_at DESC LIMIT ?",
+                    (state, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM bridge_tasks ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [
+                {
+                    "task_id": r["task_id"],
+                    "idempotency_key": r["idempotency_key"],
+                    "spec_id": r["spec_id"],
+                    "repo": r["repo"],
+                    "goal": r["goal"],
+                    "allowed_merge_target": r["allowed_merge_target"],
+                    "state": r["state"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                    "error": r["error"],
+                }
+                for r in rows
+            ]
+
+    def update_bridge_task_state(
+        self, task_id: str, state: str, error: Optional[str] = None
+    ) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE bridge_tasks SET state = ?, error = ?, updated_at = ? WHERE task_id = ?",
+                (state, error, now, task_id),
+            )
+
+    def claim_event_durable(
+        self,
+        event_id: str,
+        action: str,
+        status: str,
+        chat_id: Optional[str] = None,
+        message_created_at: Optional[int] = None,
+        spec_id: Optional[str] = None,
+        repo_path: Optional[str] = None,
+        task_id: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> bool:
+        """Atomically claim an event in bridge_processed_events.
+        
+        Returns True if newly inserted, False if already claimed.
+        """
+        now = time.time()
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO bridge_processed_events (
+                        event_id, chat_id, message_created_at, spec_id, repo_path,
+                        task_id, action, status, detail, processed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        chat_id,
+                        message_created_at,
+                        spec_id,
+                        repo_path,
+                        task_id,
+                        action,
+                        status,
+                        detail,
+                        now,
+                    ),
+                )
+                return cur.rowcount > 0
+        except sqlite3.Error:
+            return False
+
+    def is_event_claimed(self, event_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT event_id FROM bridge_processed_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            return row is not None
+
+    def get_cursor(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM bridge_cursors WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "chat_id": row["chat_id"],
+                "last_seen_created_at": row["last_seen_created_at"],
+                "last_seen_message_id": row["last_seen_message_id"],
+                "updated_at": row["updated_at"],
+            }
+
+    def save_cursor(self, chat_id: str, last_created_at: int, last_msg_id: str) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO bridge_cursors (chat_id, last_seen_created_at, last_seen_message_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    last_seen_created_at = excluded.last_seen_created_at,
+                    last_seen_message_id = excluded.last_seen_message_id,
+                    updated_at = excluded.updated_at
+                """,
+                (chat_id, last_created_at, last_msg_id, now),
+            )
+
+    def create_question(
+        self,
+        question_id: str,
+        task_id: str,
+        prompt: str,
+        conversation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO bridge_user_questions (
+                    question_id, task_id, conversation_id, prompt, status, created_at
+                ) VALUES (?, ?, ?, ?, 'PENDING', ?)
+                """,
+                (question_id, task_id, conversation_id, prompt, now),
+            )
+            return {
+                "question_id": question_id,
+                "task_id": task_id,
+                "conversation_id": conversation_id,
+                "prompt": prompt,
+                "status": "PENDING",
+                "answer_text": None,
+                "created_at": now,
+                "answered_at": None,
+            }
+
+    def get_question(self, question_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM bridge_user_questions WHERE question_id = ?",
+                (question_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "question_id": row["question_id"],
+                "task_id": row["task_id"],
+                "conversation_id": row["conversation_id"],
+                "prompt": row["prompt"],
+                "status": row["status"],
+                "answer_text": row["answer_text"],
+                "created_at": row["created_at"],
+                "answered_at": row["answered_at"],
+            }
+
+    def list_questions(
+        self, task_id: Optional[str] = None, status: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            query = "SELECT * FROM bridge_user_questions WHERE 1=1"
+            params: List[Any] = []
+            if task_id:
+                query += " AND task_id = ?"
+                params.append(task_id)
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+            query += " ORDER BY created_at ASC"
+            rows = conn.execute(query, tuple(params)).fetchall()
+            return [
+                {
+                    "question_id": r["question_id"],
+                    "task_id": r["task_id"],
+                    "conversation_id": r["conversation_id"],
+                    "prompt": r["prompt"],
+                    "status": r["status"],
+                    "answer_text": r["answer_text"],
+                    "created_at": r["created_at"],
+                    "answered_at": r["answered_at"],
+                }
+                for r in rows
+            ]
+
+    def answer_question(self, question_id: str, answer_text: str) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        with self._connect() as conn:
+            # Check question is PENDING
+            row = conn.execute(
+                "SELECT * FROM bridge_user_questions WHERE question_id = ?",
+                (question_id,),
+            ).fetchone()
+            if not row:
+                return None
+            if row["status"] != "PENDING":
+                return {
+                    "question_id": row["question_id"],
+                    "status": row["status"],
+                    "error": f"Question {question_id} is already in status {row['status']}",
+                }
+            conn.execute(
+                """
+                UPDATE bridge_user_questions
+                SET status = 'ANSWERED', answer_text = ?, answered_at = ?
+                WHERE question_id = ?
+                """,
+                (answer_text, now, question_id),
+            )
+            return {
+                "question_id": question_id,
+                "task_id": row["task_id"],
+                "conversation_id": row["conversation_id"],
+                "prompt": row["prompt"],
+                "status": "ANSWERED",
+                "answer_text": answer_text,
+                "created_at": row["created_at"],
+                "answered_at": now,
+            }
+
+    def cancel_task(self, task_id: str, reason: str = "") -> bool:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE bridge_tasks
+                SET state = 'CANCELLED', error = ?, updated_at = ?
+                WHERE task_id = ? AND state NOT IN ('DONE', 'CANCELLED')
+                """,
+                (reason or "Cancelled by operator", now, task_id),
+            )
+            # Also expire any pending questions
+            conn.execute(
+                """
+                UPDATE bridge_user_questions
+                SET status = 'CANCELLED', answered_at = ?
+                WHERE task_id = ? AND status = 'PENDING'
+                """,
+                (now, task_id),
+            )
+            # Also update tasks table if present
+            conn.execute(
+                """
+                UPDATE tasks
+                SET state = 'CANCELLED', updated_at = ?
+                WHERE task_id = ? AND state NOT IN ('DONE', 'CANCELLED')
+                """,
+                (now, task_id),
+            )
+            return cur.rowcount > 0
+

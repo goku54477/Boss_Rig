@@ -422,9 +422,16 @@ def main() -> int:
     p_rec = subparsers.add_parser("recover", help="Recover locks and reset stale seats")
     p_rec.add_argument("--force", action="store_true", help="Force lock removal")
 
+    # bridge
+    p_bridge = subparsers.add_parser("bridge", help="Boss Rig Bridge and Chat Watcher tools")
+    p_bridge.add_argument("bridge_args", nargs=argparse.REMAINDER, help="Bridge arguments")
+
     args = parser.parse_args()
 
-    if args.subcommand == "up":
+    if args.subcommand == "bridge":
+        from orchestrator.bridge_cli import main as bridge_main
+        return bridge_main(args.bridge_args)
+    elif args.subcommand == "up":
         return cmd_up(args)
     elif args.subcommand == "status":
         return cmd_status(args)
