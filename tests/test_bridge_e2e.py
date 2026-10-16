@@ -584,6 +584,9 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         with self.assertRaises(BridgeError):
             service.task_answer(qid, "Mode B")
 
+        # Allow worker thread to complete execution before test teardown
+        time.sleep(0.4)
+
     # --- Test 12: Cancellation and timeouts release resources safely ---
     def test_12_cancellation_releases_resources(self) -> None:
         """12. Cancellation and timeouts release resources safely."""
