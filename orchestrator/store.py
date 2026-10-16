@@ -361,8 +361,56 @@ class TaskStore:
     def block_task(self, task_id: str, reason: str = "") -> TaskRecord:
         return self.transition_task(task_id, TaskState.BLOCKED, reason=reason)
 
-    def cancel_task(self, task_id: str, reason: str = "") -> TaskRecord:
-        return self.transition_task(task_id, TaskState.CANCELLED, reason=reason)
+    def cancel_task(self, task_id: str, reason: str = "") -> Optional[TaskRecord]:
+        now = time.time()
+        task = self.get_task(task_id)
+        with self._connect() as conn:
+            cur_bridge = conn.execute(
+                """
+                UPDATE bridge_tasks
+                SET state = 'CANCELLED', error = ?, updated_at = ?
+                WHERE task_id = ? AND state NOT IN ('DONE', 'CANCELLED')
+                """,
+                (reason or "Cancelled by operator", now, task_id),
+            )
+            conn.execute(
+                """
+                UPDATE bridge_user_questions
+                SET status = 'CANCELLED', answered_at = ?
+                WHERE task_id = ? AND status = 'PENDING'
+                """,
+                (now, task_id),
+            )
+            cur_task = conn.execute(
+                """
+                UPDATE tasks
+                SET state = 'CANCELLED', updated_at = ?
+                WHERE task_id = ? AND state NOT IN ('DONE', 'CANCELLED')
+                """,
+                (now, task_id),
+            )
+            if task and task.state not in (TaskState.DONE, TaskState.CANCELLED):
+                conn.execute(
+                    """
+                    INSERT INTO task_transitions (
+                        task_id, from_state, to_state, reason, metadata_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        task.state.value,
+                        TaskState.CANCELLED.value,
+                        reason,
+                        None,
+                        now,
+                    ),
+                )
+        if cur_bridge.rowcount > 0 or cur_task.rowcount > 0 or task:
+            updated = self.get_task(task_id)
+            if updated:
+                return updated
+            return TaskRecord(task_id=task_id, state=TaskState.CANCELLED, goal="")
+        return None
 
     def set_seat_mode(
         self,
@@ -769,35 +817,4 @@ class TaskStore:
                 "created_at": row["created_at"],
                 "answered_at": now,
             }
-
-    def cancel_task(self, task_id: str, reason: str = "") -> bool:
-        now = time.time()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                UPDATE bridge_tasks
-                SET state = 'CANCELLED', error = ?, updated_at = ?
-                WHERE task_id = ? AND state NOT IN ('DONE', 'CANCELLED')
-                """,
-                (reason or "Cancelled by operator", now, task_id),
-            )
-            # Also expire any pending questions
-            conn.execute(
-                """
-                UPDATE bridge_user_questions
-                SET status = 'CANCELLED', answered_at = ?
-                WHERE task_id = ? AND status = 'PENDING'
-                """,
-                (now, task_id),
-            )
-            # Also update tasks table if present
-            conn.execute(
-                """
-                UPDATE tasks
-                SET state = 'CANCELLED', updated_at = ?
-                WHERE task_id = ? AND state NOT IN ('DONE', 'CANCELLED')
-                """,
-                (now, task_id),
-            )
-            return cur.rowcount > 0
 

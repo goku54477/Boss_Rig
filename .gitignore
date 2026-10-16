@@ -15,14 +15,20 @@ __pycache__/
 auth.json
 auth.toml
 credentials.json
+*.token
 *.key
 *.pem
 *.p12
 
-# Database files
+# Database files and runtime state
 *.sqlite
 *.sqlite3
 *.db
 openrig.sqlite
 goldfish.db
 .disposable-live-repo/
+
+# Transcripts and local chat state
+chats/
+inbox.json
+

@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://python.org)
 [![Git Worktrees](https://img.shields.io/badge/Isolation-Git%20Worktrees-orange.svg)](https://git-scm.com)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-32%2F32%20Passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-47%20Passing-brightgreen.svg)](tests/)
 
 **Boss Rig** is a production-minded, local-first multi-agent coding orchestration system centered exclusively on **OpenRig** as the primary orchestration and control authority.
 
@@ -135,10 +135,18 @@ Boss_Rig/
 ├── config/
 │   ├── rig.yaml                        # OpenRig seat topology declaration
 │   └── agents/                         # Neutral agent role profiles
-├── orchestrator/                       # Core orchestration framework
+├── orchestrator/                       # Core orchestration framework & bridge services
 │   ├── __init__.py
-│   ├── models.py                       # TaskRecord, TaskState, BridgeEvent schemas
-│   ├── policy.py                       # Independent review & commit pinning policy rules
+│   ├── models.py                       # TaskRecord, TaskSpec, TaskState, BridgeEvent schemas
+│   ├── policy.py                       # Independent review, commit pinning & repo path checks
+│   ├── store.py                        # Durable SQLite task, cursor & event store (tasks.sqlite)
+│   ├── task_service.py                 # Core bridge task coordinator & worker thread manager
+│   ├── chat_watcher.py                 # Goldfish transcript file watcher & spec hash validator
+│   ├── server.py                       # Authenticated REST API daemon (localhost:7440)
+│   ├── mcp_server.py                   # Model Context Protocol (MCP) server for Boss Rig tools
+│   ├── bridge_cli.py                   # Unified CLI for watcher, server, and task management
+│   ├── event_emitter.py                # OS notifications & out-of-band JSON event logging
+│   ├── security.py                     # Recursive process-tree killer & path normalizer
 │   ├── dispatcher.py                   # Seat bridge process manager & OpenRig sender
 │   └── engine.py                       # High-level task lifecycle coordinator
 ├── scripts/
@@ -148,16 +156,200 @@ Boss_Rig/
 │   ├── antigravity-seat-runner.sh      # Antigravity persistent seat entrypoint
 │   └── antigravity_seat_runner.py      # Antigravity stream-NDJSON protocol bridge
 ├── tests/
+│   ├── test_bridge_e2e.py              # End-to-end watcher, spec hash, recovery & safety tests (18 tests)
+│   ├── test_server_api.py              # REST API bearer authentication & endpoint tests (4 tests)
+│   ├── test_mcp_server.py              # Native stdio MCP server tools test (1 test)
 │   ├── test_worktree_gate.py           # Worktree isolation & merge lock unit tests (5 tests)
 │   ├── test_opencode_bridge.py         # OpenCode persistent bridge unit tests (5 tests)
 │   ├── test_antigravity_bridge.py      # Antigravity stream bridge unit tests (7 tests)
 │   ├── test_scheduler_and_policy.py    # Policy engine & role assignment tests (4 tests)
+│   ├── test_store_and_idempotency.py   # SQLite storage, transitions & event deduplication (6 tests)
 │   ├── test_interchangeability_matrix.py # 3x3 Engine x Role matrix acceptance tests (9 tests)
 │   └── test_end_to_end_workflow.py     # Full multi-role E2E pipeline & crash recovery (2 tests)
 ├── deep-research-report.md             # Comprehensive architectural research document
 ├── orchestrator-implementation-plan.md # 8-milestone engineering plan
 └── README.md
 ```
+
+---
+
+## 🌉 Goldfish → Boss Rig Execution Bridge
+
+### 1. Architectural Overview & Context
+Goldfish Desktop provides persistent contextual memory and chat capabilities, but (as of v0.1.63) does not support outbound shell execution, custom chat-tool registration, or direct orchestrator dispatch.
+
+To enable Jacob to develop specifications inside Goldfish and have Boss Rig execute them autonomously without manual copy-paste, Boss Rig provides a **durable, filesystem-based execution bridge**:
+
+```mermaid
+flowchart TD
+    subgraph GoldfishApp ["Goldfish Desktop (Chat Interface)"]
+        GC["Chat Transcript\n(AppData/Roaming/goldfish/chats/*.json)"]
+        PROP["1. Spec Proposal\n(fenced boss-rig-spec codeblock)"]
+        APPR["2. Explicit User Approval\n(@boss-rig approve spec_id=sha256:...)"]
+    end
+
+    subgraph BridgeControl ["Boss Rig Bridge Layer (orchestrator/)"]
+        WATCH["ChatWatcher (chat_watcher.py)\nPolls transcripts & durable SQLite cursor"]
+        VERIF["Cryptographic Hash Validator\n(Canonical JSON SHA-256)"]
+        SVC["TaskService (task_service.py)\nLifecycle & Worker Manager"]
+        STORE[("Durable SQLite Store\n.openrig-bridge/tasks.sqlite")]
+        EMIT["EventEmitter (event_emitter.py)\nOS Toasts & Event Log"]
+    end
+
+    subgraph TwoEngineExecution ["Two-Engine Orchestration Pipeline"]
+        PLAN["antigravity-1 (Planner)\nFormulates plan"]
+        IMPL["opencode-1 (Implementer)\nWrites code & commits in worktree"]
+        REV["antigravity-1 (Reviewer)\nReviews candidate commit (Reviewer != Implementer)"]
+        GATE["worktree-gate.sh\nRuns deterministic verification commands"]
+        INT["Git Integration Branch\nClean merge upon passing all verification tests"]
+    end
+
+    PROP --> GC
+    APPR --> GC
+    GC -->|Read-only polling| WATCH
+    WATCH --> VERIF
+    VERIF -->|Durable Claim| STORE
+    STORE --> SVC
+    SVC --> PLAN
+    PLAN --> IMPL
+    IMPL --> REV
+    REV --> GATE
+    GATE --> INT
+    SVC -->|Progress, Questions, Completion| EMIT
+```
+
+### 2. Cryptographic Spec Proposal & Approval Flow
+Execution requires a two-step explicit protocol to ensure that assistant text, historical quotes, or accidental mentions never trigger execution.
+
+#### Step 1: Immutable Specification Proposal
+The specification block is formatted inside a fenced `boss-rig-spec` markdown codeblock containing strict JSON:
+````markdown
+```boss-rig-spec
+{
+  "acceptance_criteria": [
+    "hello.py exists",
+    "say_hello() returns 'hello'"
+  ],
+  "allowed_merge_target": "integration",
+  "assigned_agents": {
+    "implementer": "opencode-1",
+    "planner": "antigravity-1",
+    "reviewer": "antigravity-1"
+  },
+  "constraints": [
+    "Do not touch files outside .disposable-live-repo",
+    "No network calls in generated application code or verification tests"
+  ],
+  "goal": "Implement say_hello() function in hello.py returning 'hello'",
+  "repo": "C:/Users/jacob/Boss Agent/.disposable-live-repo",
+  "spec_version": 1,
+  "timeout_sec": 600,
+  "verification_commands": [
+    "python -c \"import hello; assert hello.say_hello() == 'hello'\""
+  ]
+}
+```
+````
+
+The canonical SHA-256 hash is computed deterministically:
+$$\text{spec\_id} = \text{sha256}(\text{canonical\_json}(\text{spec\_dict}))$$
+*(using `sort_keys=True` and compact separators `(',', ':')`)*.
+
+#### Step 2: Explicit User Approval Command
+Only an explicit follow-up message authored by `role: "user"` triggers dispatch:
+```text
+@boss-rig approve spec_id=sha256:7c0c5a548ae93924417d623e06f77969cd993690f057407d3c094281bc0160b9
+```
+
+#### Strict Safety Invariants for Approval Detection:
+- **Authorship Verification**: Only messages with `role == "user"` are parsed. Messages with `role == "assistant"` or `role == "system"` are ignored.
+- **Quote & Codeblock Stripping**: Markdown blockquotes (`>`) and nested codeblocks are stripped before scanning for `@boss-rig approve` to ensure quoted examples or documentation snippets cannot trigger execution.
+- **Startup Baselining**: When the watcher initializes, all existing transcript messages are recorded as `BASELINED` / `IGNORED`. Restarting the watcher will **never** replay historical approvals.
+- **Transactional Deduplication**: Approvals are claimed in SQLite (`bridge_processed_events`) with an atomic transaction before dispatch. Replay attempts are rejected with `DUPLICATE_APPROVAL`.
+
+---
+
+### 3. Supported Two-Engine Workflow & Codex Hold Policy
+Boss Rig enforces a hardened two-engine operational profile:
+1. **Planner**: `antigravity-1` (Antigravity engine)
+2. **Implementer**: `opencode-1` (OpenCode engine)
+3. **Reviewer**: `antigravity-1` (Antigravity engine)
+4. **Independent Review Invariant**: The policy engine strictly enforces $Reviewer \ne Implementer$. Because `antigravity-1` $\ne$ `opencode-1`, this invariant is fully satisfied.
+5. **Codex Hold Policy**: The Codex seat (`codex-1`) is placed in persistent `SeatMode.MANUAL_HOLD` in the database. It is **disabled** and will never be scheduled, dispatched, or used as a fallback engine under any circumstances.
+
+---
+
+### 4. Interactive Two-Way Question Loop
+When an agent encounters ambiguous requirements, it pauses execution and awaits operator clarification:
+1. **Transition to `WAITING_FOR_USER`**: The task worker thread emits a `question_asked` event and enters a wait state on a `threading.Event`.
+2. **Question Event**: Stored in `bridge_user_questions` table with a unique `question_id`, `task_id`, and prompt. Dispatched to the operator via OS notifications and EventEmitter.
+3. **Operator Answer**: The user answers via CLI or REST API:
+   ```bash
+   python -m orchestrator.bridge_cli answer <question_id> "<operator_answer_text>"
+   ```
+4. **Scope Validation & Resumption**: The answer is validated against scope expansion rules (it cannot alter the repository path or core acceptance criteria). The worker thread is unblocked and resumes implementation turn with the answer appended to context.
+
+---
+
+### 5. Security Controls & Sandbox Reality
+> [!WARNING]
+> **Worktrees are NOT a Security Sandbox**: Git worktrees provide isolated directories and clean Git branches so concurrent agents do not overwrite each other's uncommitted work. However, worktrees do **not** provide kernel sandboxing (namespaces, cgroups, chroot, or network isolation). Agent processes execute on the host with the standard user permissions of the operator account.
+
+Boss Rig enforces strict defense-in-depth controls:
+- **Repository Boundary Enforcement**: All file writes and git operations are validated via `normalize_repo_path`. Path traversal attempts (`../`) and paths outside the authorized repository root are rejected with `PolicyViolation`.
+- **Target Repository Isolation**: Worktree provisioning, branch checkouts, and merge verification gates strictly target the repository specified in the approved specification (e.g. `.disposable-live-repo`), never Boss Rig's own working tree.
+- **Process-Tree Termination**: On cancellation or timeout, `kill_process_tree(pid)` recursively queries the process hierarchy and forcefully terminates all child subprocesses (using `taskkill /F /T` on Windows and `os.killpg` on POSIX) to prevent runaway background compilers or tests.
+- **Verification Gate**: Candidate code is evaluated against `verification_commands` inside the candidate tree before any merge lock is acquired. Unverified or failing code can never reach `integration`.
+
+---
+
+### 6. Bridge Service Interfaces
+
+The Boss Rig Bridge provides three transport mechanisms:
+
+#### A. File Watcher CLI (`orchestrator/bridge_cli.py`)
+```bash
+# Start watcher in safe dry-run mode (default, logs detections without dispatching agents)
+python -m orchestrator.bridge_cli watch --interval 0.5
+
+# Start watcher in live execution mode
+python -m orchestrator.bridge_cli watch --live --interval 0.5
+
+# Inspect active bridge tasks and questions
+python -m orchestrator.bridge_cli status
+python -m orchestrator.bridge_cli questions
+```
+
+#### B. Authenticated REST API (`orchestrator/server.py`)
+```bash
+# Start REST server on default localhost:7440
+python -m orchestrator.bridge_cli serve --port 7440
+```
+- **Authentication**: Requires `Authorization: Bearer <token>` (stored at `.openrig-bridge/auth.token`).
+- **Endpoints**:
+  - `GET /health`: Health and engine status check.
+  - `POST /tasks`: Submit and claim task.
+  - `GET /tasks/<id>`: Retrieve task record and lifecycle state.
+  - `POST /tasks/<id>/cancel`: Abort task and terminate child process tree.
+  - `GET /questions`: List pending questions.
+  - `POST /questions/<id>/answer`: Submit answer and resume waiting task.
+
+#### C. Model Context Protocol (MCP) Server (`orchestrator/mcp_server.py`)
+Exposes Boss Rig directly to MCP-compatible host applications over stdio:
+- Tools: `submit_task`, `approve_task`, `get_task_status`, `list_tasks`, `ask_user_question`, `answer_question`, `cancel_task`.
+
+---
+
+### 7. Current Status & Known Limitations
+
+| Component | Status | Verification & Limitations |
+| :--- | :---: | :--- |
+| **Chat Watcher** | ✅ **Verified** | Verified live in dry-run with actual Goldfish transcript files. Ignores assistant messages, blockquotes, and historical baseline. |
+| **Spec Hash Validation** | ✅ **Verified** | Canonical JSON SHA-256 calculation matches across watcher and task submission. |
+| **Two-Engine Workflow** | ✅ **Verified** | Antigravity (plan/review) + OpenCode (implement), Reviewer $\ne$ Implementer enforced, Codex on `MANUAL_HOLD`. |
+| **Question Loop** | ✅ **Verified** | Verified with CLI and REST API answering loops; scope expansion guarded. |
+| **Crash Recovery & Cancel** | ✅ **Verified** | Process tree killed cleanly; state recovered from SQLite without task replay. |
+| **Same-Chat Delivery** | ⚠️ **Limitation** | Goldfish Desktop v0.1.63 lacks outbound tool calling or bidirectional chat injection. Results are emitted via OS notifications and EventEmitter fallback. Same-chat delivery remains blocked pending Goldfish host tool support. |
 
 ---
 
