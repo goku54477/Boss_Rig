@@ -30,6 +30,7 @@ jobs:
           git config --global user.email "ci@boss-rig.local"
           git checkout -B main
           git branch -f integration HEAD
+          git branch --set-upstream-to=origin/integration integration 2>/dev/null || true
 
       - name: Run Core Test Suite
         run: |
@@ -51,6 +52,11 @@ jobs:
           # 6. Fault injection and recovery
           python3 -m unittest tests/test_fault_injection.py
 
+      - name: Run Goldfish Bridge Test Suite
+        run: |
+          python3 -m unittest tests/test_bridge_e2e.py tests/test_server_api.py tests/test_mcp_server.py
+
       - name: Run Concurrency Gate Contention Test
         run: |
           python3 -m unittest tests/test_concurrency_proof.py
+

@@ -156,7 +156,18 @@ class TestConcurrencyProof(unittest.TestCase):
 
         # Invariant: All 3 modules must exist in _integration worktree
         int_wt = REPO_ROOT / ".worktrees" / "_integration"
-        run_git(int_wt, "pull", "--rebase")
+        has_upstream = (
+            subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "@{u}"],
+                cwd=str(int_wt),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode
+            == 0
+        )
+        if has_upstream:
+            run_git(int_wt, "pull", "--rebase")
+
 
         for item in CONCURRENCY_RESULTS:
             mod_file = int_wt / f"{item['module']}.py"
