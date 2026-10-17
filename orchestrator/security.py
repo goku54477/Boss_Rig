@@ -90,11 +90,31 @@ def is_pid_alive(pid: int) -> bool:
         except Exception:
             return False
     else:
+        # Check if it's a child process that already exited and needs reaping
+        try:
+            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped_pid == pid:
+                return False
+        except (ChildProcessError, OSError):
+            pass
+
         try:
             os.kill(pid, 0)
-            return True
         except (OSError, ProcessLookupError):
             return False
+
+        # On Linux, inspect /proc/[pid]/stat to detect zombie ('Z') state
+        try:
+            stat_path = Path(f"/proc/{pid}/stat")
+            if stat_path.exists():
+                stat_content = stat_path.read_text(encoding="utf-8", errors="ignore")
+                state = stat_content.split(")")[1].strip().split()[0]
+                if state == "Z":
+                    return False
+        except Exception:
+            pass
+
+        return True
 
 
 def kill_process_tree(pid: int, timeout_sec: float = 3.0) -> bool:

@@ -808,7 +808,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             deadline = time.time() + 3.0
             dead = False
             while time.time() < deadline:
-                if not is_pid_alive(pid):
+                if proc.poll() is not None or not is_pid_alive(pid):
                     dead = True
                     break
                 time.sleep(0.1)
