@@ -788,10 +788,12 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         task_id = res["task_id"]
 
         # Launch a harmless local child process simulating an active seat runner
+        popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+        if sys.platform != "win32":
+            popen_kwargs["start_new_session"] = True
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            **popen_kwargs,
         )
         try:
             pid = proc.pid

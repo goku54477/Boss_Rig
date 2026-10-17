@@ -110,16 +110,29 @@ def kill_process_tree(pid: int, timeout_sec: float = 3.0) -> bool:
         except Exception:
             pass
     else:
-        # On POSIX / WSL, kill process group
+        # On POSIX / WSL, kill process group only if distinct from caller, otherwise kill pid
+        try:
+            my_pgid = os.getpgrp()
+        except Exception:
+            my_pgid = -1
+
         try:
             pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGTERM)
+            if pgid != my_pgid and pgid > 1:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+
             deadline = time.time() + timeout_sec
             while time.time() < deadline:
                 if not is_pid_alive(pid):
                     return True
                 time.sleep(0.1)
-            os.killpg(pgid, signal.SIGKILL)
+
+            if pgid != my_pgid and pgid > 1:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
         except Exception:
             try:
                 os.kill(pid, signal.SIGKILL)
