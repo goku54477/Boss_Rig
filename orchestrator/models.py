@@ -207,11 +207,16 @@ class UserQuestion:
 class ApprovalRecord:
     spec_id: str
     repo: str
-    source: str  # "goldfish_chat", "operator_cli"
+    source: str  # "goldfish_chat", "operator_cli", "local_web"
     conversation_id: Optional[str] = None
     message_id: Optional[str] = None
     approval_token: Optional[str] = None
     approved_by: str = "user"
+    nonce: Optional[str] = None
+    expires_at: Optional[float] = None
+    allowed_actions: List[str] = field(default_factory=lambda: ["execute_local"])
+    base_commit: Optional[str] = None
+    signature: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -223,7 +228,83 @@ class ApprovalRecord:
             "message_id": self.message_id,
             "approval_token": self.approval_token,
             "approved_by": self.approved_by,
+            "nonce": self.nonce,
+            "expires_at": self.expires_at,
+            "allowed_actions": self.allowed_actions,
+            "base_commit": self.base_commit,
+            "signature": self.signature,
             "timestamp": self.timestamp,
         }
+
+
+@dataclass
+class TaskProposal:
+    proposal_id: str
+    spec: TaskSpec
+    spec_hash: str
+    status: str = "PENDING_APPROVAL"  # PENDING_APPROVAL, APPROVED, REJECTED, EXPIRED, CONSUMED
+    created_at: float = field(default_factory=time.time)
+    expires_at: float = field(default_factory=lambda: time.time() + 3600.0)
+    source: str = "conversational"
+    conversation_id: Optional[str] = None
+    message_id: Optional[str] = None
+    approval_token: Optional[str] = None
+    rejection_reason: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "proposal_id": self.proposal_id,
+            "spec": self.spec.to_canonical_dict(),
+            "spec_hash": self.spec_hash,
+            "status": self.status,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "source": self.source,
+            "conversation_id": self.conversation_id,
+            "message_id": self.message_id,
+            "approval_token": self.approval_token,
+            "rejection_reason": self.rejection_reason,
+        }
+
+
+@dataclass
+class OutboxEvent:
+    id: Optional[int]
+    task_id: str
+    event_id: str
+    seq: int
+    event_type: str
+    lifecycle_status: str
+    role: Optional[str] = None
+    seat_id: Optional[str] = None
+    summary: str = ""
+    attempt: int = 1
+    data: Dict[str, Any] = field(default_factory=dict)
+    candidate_commit: Optional[str] = None
+    merge_commit: Optional[str] = None
+    review_findings: Optional[Dict[str, Any]] = None
+    test_evidence: Optional[Dict[str, Any]] = None
+    created_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "event_id": self.event_id,
+            "seq": self.seq,
+            "event_type": self.event_type,
+            "lifecycle_status": self.lifecycle_status,
+            "role": self.role,
+            "seat_id": self.seat_id,
+            "summary": self.summary,
+            "attempt": self.attempt,
+            "data": self.data,
+            "candidate_commit": self.candidate_commit,
+            "merge_commit": self.merge_commit,
+            "review_findings": self.review_findings,
+            "test_evidence": self.test_evidence,
+            "created_at": self.created_at,
+        }
+
 
 

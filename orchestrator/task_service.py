@@ -103,15 +103,71 @@ class TaskService:
                 f"Approval record repo '{approval_record.repo}' does not match spec repo '{spec.repo}'."
             )
 
+        # Enforce expiration check if expires_at provided
+        if approval_record.expires_at is not None and time.time() > approval_record.expires_at:
+            raise ApprovalVerificationError(
+                f"Approval record has expired (expired at {approval_record.expires_at})."
+            )
+
+        # Enforce permissions: execute_local only; forbid remote push / deployment
+        allowed_actions = set(approval_record.allowed_actions or ["execute_local"])
+        if "remote_push" in allowed_actions or "deploy_production" in allowed_actions:
+            raise ApprovalVerificationError(
+                "Approval grants forbidden permissions: remote push and production deployment are strictly disallowed."
+            )
+
+        # Enforce source validation & cryptographic token checks
+        valid_sources = ("goldfish_chat", "operator_cli", "local_web")
+        if approval_record.source not in valid_sources:
+            raise ApprovalVerificationError(
+                f"Unknown approval source '{approval_record.source}'. Must be one of {valid_sources}."
+            )
+
         if approval_record.source == "goldfish_chat":
             if not approval_record.message_id or not self.store.is_event_claimed(approval_record.message_id):
                 raise ApprovalVerificationError(
                     f"Approval message '{approval_record.message_id}' was not verified in chat transcripts."
                 )
-        elif approval_record.source != "operator_cli":
-            raise ApprovalVerificationError(
-                f"Unknown approval source '{approval_record.source}'. Must be 'goldfish_chat' or 'operator_cli'."
+        elif approval_record.source in ("operator_cli", "local_web"):
+            # Enforce cryptographic token verification using secret key
+            from orchestrator.server import get_or_create_auth_token
+            secret_key = get_or_create_auth_token()
+            token = approval_record.approval_token or approval_record.signature
+            if not token:
+                raise ApprovalVerificationError(
+                    f"Untrusted {approval_record.source} approval rejected: valid cryptographic approval_token or signature required."
+                )
+            from orchestrator.security import verify_approval_token
+            is_valid = verify_approval_token(
+                token=token,
+                spec_id=computed_hash,
+                repo=spec.repo,
+                conversation_id=approval_record.conversation_id or "cli",
+                message_id=approval_record.message_id or "cli",
+                secret_key=secret_key,
+                nonce=approval_record.nonce,
+                expires_at=approval_record.expires_at,
+                allowed_actions=approval_record.allowed_actions,
             )
+            if not is_valid:
+                raise ApprovalVerificationError(
+                    "Cryptographic approval signature verification failed. Token does not match expected HMAC."
+                )
+
+        # Enforce single-use nonce consumption if nonce provided
+        if approval_record.nonce:
+            fresh = self.store.consume_approval_nonce(
+                nonce=approval_record.nonce,
+                spec_id=computed_hash,
+                repo=spec.repo,
+                conversation_id=approval_record.conversation_id,
+                task_id=idempotency_key,
+            )
+            if not fresh:
+                raise ApprovalVerificationError(
+                    f"Approval nonce '{approval_record.nonce}' has already been consumed (replay attack prevented)."
+                )
+
 
 
         # 5. Check dry-run mode
@@ -143,7 +199,14 @@ class TaskService:
                 "is_new": False,
             }
 
-        # 7. Record event & fire desktop toast
+        # 7. Record event & fire desktop toast & append to durable outbox
+        self.store.emit_outbox_event(
+            task_id=task_id,
+            event_type="task.approved",
+            lifecycle_status="QUEUED",
+            summary=f"Task approved for {spec.repo}: {spec.goal[:60]}",
+            data={"repo": spec.repo, "goal": spec.goal, "spec_id": computed_hash},
+        )
         self.emitter.emit(
             "TASK_SUBMITTED",
             task_id=task_id,
@@ -160,6 +223,7 @@ class TaskService:
             daemon=True,
             name=f"worker-{task_id}",
         )
+
         with self._lock:
             self._active_workers[task_id] = worker
             self._cancellation_flags[task_id] = False
@@ -184,18 +248,54 @@ class TaskService:
         return task
 
     def task_result(self, task_id: str) -> Dict[str, Any]:
-        """Fetch terminal execution result and merge commit."""
+        """Fetch terminal execution result, commits, and verification evidence."""
         task = self.task_status(task_id)
         state = task.get("state")
         is_finished = state in ("DONE", "REVIEW_FAILED", "CANCELLED", "BLOCKED")
+
+        # Query core task record from tasks table for commits if available
+        rec = self.store.get_task(task_id)
+        candidate_commit = rec.candidate_commit if rec else None
+        merge_commit = rec.merge_commit if rec else None
+
+        # Fetch outbox events for evidence and reviewer findings
+        outbox_events = self.store.get_task_outbox_events(task_id, limit=200)
+        review_findings = None
+        test_evidence = None
+        for ev in reversed(outbox_events):
+            if not review_findings and ev.get("review_findings"):
+                review_findings = ev.get("review_findings")
+            if not test_evidence and ev.get("test_evidence"):
+                test_evidence = ev.get("test_evidence")
+            if not candidate_commit and ev.get("candidate_commit"):
+                candidate_commit = ev.get("candidate_commit")
+            if not merge_commit and ev.get("merge_commit"):
+                merge_commit = ev.get("merge_commit")
+
+        spec = task.get("spec", {})
         return {
             "task_id": task_id,
             "state": state,
             "finished": is_finished,
             "error": task.get("error"),
+            "repo": task.get("repo"),
             "allowed_merge_target": task.get("allowed_merge_target"),
             "spec_id": task.get("spec_id"),
+            "goal": task.get("goal"),
+            "candidate_commit": candidate_commit,
+            "merge_commit": merge_commit,
+            "verification_commands": spec.get("verification_commands", []),
+            "assigned_agents": spec.get("assigned_agents", {}),
+            "review_findings": review_findings,
+            "test_evidence": test_evidence,
         }
+
+
+    def get_task_outbox_events(
+        self, task_id: str, after_seq: int = 0, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Fetch ordered timeline outbox events for task_id."""
+        return self.store.get_task_outbox_events(task_id, after_seq=after_seq, limit=limit)
 
     def task_list(self, limit: int = 50, state: Optional[str] = None) -> List[Dict[str, Any]]:
         """List tasks with optional state filtering."""
@@ -228,6 +328,13 @@ class TaskService:
 
         cancelled = self.store.cancel_task(task_id, reason=reason)
         if cancelled:
+            self.store.emit_outbox_event(
+                task_id=task_id,
+                event_type="task.cancelled",
+                lifecycle_status="CANCELLED",
+                summary=f"Task {task_id} was cancelled: {reason}",
+                data={"reason": reason, "killed_pids": pids},
+            )
             self.emitter.emit(
                 "TASK_CANCELLED",
                 task_id=task_id,
@@ -237,20 +344,100 @@ class TaskService:
             )
         return cancelled
 
+    def get_task_events(
+        self, task_id: str, after_seq: int = 0, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Retrieve ordered outbox events for a task since after_seq."""
+        return self.store.get_task_outbox_events(task_id, after_seq=after_seq, limit=limit)
+
+    def propose_task(
+        self,
+        spec: TaskSpec,
+        source: str = "conversational",
+        conversation_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a pending, unapproved TaskProposal without executing it."""
+        # Validate repository & merge target against policy
+        PolicyEngine.assert_allowed_repository(spec.repo, extra_allowed=self.extra_allowed_repos)
+        PolicyEngine.assert_allowed_merge_target(spec.allowed_merge_target)
+
+        spec_hash = spec.compute_hash()
+        now = time.time()
+        proposal_id = f"PROP-{int(now * 1000)}"
+
+        self.store.save_proposal(
+            proposal_id=proposal_id,
+            spec_id=spec_hash,
+            repo=spec.repo,
+            goal=spec.goal,
+            spec_dict=spec.to_canonical_dict(),
+            status="PENDING_APPROVAL",
+            source=source,
+            conversation_id=conversation_id,
+            message_id=message_id,
+        )
+
+        return {
+            "proposal_id": proposal_id,
+            "spec_id": spec_hash,
+            "repo": spec.repo,
+            "goal": spec.goal,
+            "status": "PENDING_APPROVAL",
+            "spec": spec.to_canonical_dict(),
+            "message": "Task proposal created. Requires explicit authenticated human approval before dispatch.",
+        }
+
+    def get_proposal(self, proposal_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch pending or processed task proposal."""
+        return self.store.get_proposal(proposal_id)
+
+    def list_proposals(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List proposals filtered by status."""
+        return self.store.list_proposals(status=status)
+
+    def reject_proposal(self, proposal_id: str, reason: str = "") -> bool:
+        """Reject a pending proposal."""
+        prop = self.store.get_proposal(proposal_id)
+        if not prop:
+            raise TaskNotFoundError(f"Proposal '{proposal_id}' not found.")
+        self.store.update_proposal_status(proposal_id, status="REJECTED", rejection_reason=reason)
+        return True
+
+
     def task_questions(
         self, task_id: Optional[str] = None, status: Optional[str] = "PENDING"
     ) -> List[Dict[str, Any]]:
         """List pending or answered questions."""
         return self.store.list_questions(task_id=task_id, status=status)
 
-    def task_answer(self, question_id: str, answer: str) -> Dict[str, Any]:
-        """Provide an answer to a pending user question."""
+    def task_answer(
+        self,
+        question_id: str,
+        answer: str,
+        task_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Provide an answer to a pending user question with strict task and conversation binding."""
         q = self.store.get_question(question_id)
         if not q:
             raise BridgeError(f"Question '{question_id}' not found.")
 
         if q["status"] != "PENDING":
             raise BridgeError(f"Question '{question_id}' is already {q['status']}.")
+
+        # Invariant: Verify task_id matches question record if provided
+        if task_id and str(task_id).strip() != str(q.get("task_id", "")).strip():
+            raise BridgeError(
+                f"Question '{question_id}' belongs to task '{q.get('task_id')}', but was answered for task '{task_id}' (cross-task interference rejected)."
+            )
+
+        # Invariant: Verify conversation_id matches question record if provided
+        if conversation_id and q.get("conversation_id"):
+            if str(conversation_id).strip() != str(q.get("conversation_id", "")).strip():
+                raise BridgeError(
+                    f"Question '{question_id}' originated in conversation '{q.get('conversation_id')}', but answer was submitted from conversation '{conversation_id}' (cross-conversation interference rejected)."
+                )
 
         # Guard against scope expansion attacks in answer text
         lower = answer.lower()
@@ -260,20 +447,21 @@ class TaskService:
             )
 
         updated = self.store.answer_question(question_id, answer)
-        task_id = q["task_id"]
+        q_task_id = q["task_id"]
 
         self.emitter.emit(
             "QUESTION_ANSWERED",
-            task_id=task_id,
+            task_id=q_task_id,
             data={"question_id": question_id, "answer": answer},
         )
 
         # Signal the waiting worker thread to wake up
         with self._lock:
-            if task_id in self._worker_events:
-                self._worker_events[task_id].set()
+            if q_task_id in self._worker_events:
+                self._worker_events[q_task_id].set()
 
         return updated or {}
+
 
     def ask_user_question(
         self,
@@ -330,6 +518,13 @@ class TaskService:
         """Background thread executing the task through the orchestration pipeline."""
         try:
             self.store.update_bridge_task_state(task_id, TaskState.ACTIVE.value)
+            self.store.emit_outbox_event(
+                task_id=task_id,
+                event_type="task.started",
+                lifecycle_status="ACTIVE",
+                summary=f"Task {task_id} execution started",
+                data={"spec_id": spec_hash, "repo": spec.repo},
+            )
 
             # Check if custom engine factory provided
             if self.engine_factory:
@@ -349,6 +544,28 @@ class TaskService:
                 success = result.get("success", False)
                 state = TaskState.DONE.value if success else TaskState.REVIEW_FAILED.value
                 error = result.get("error")
+                cand_commit = result.get("candidate_commit")
+                mrg_commit = result.get("merge_commit")
+                if result.get("review_findings"):
+                    self.store.emit_outbox_event(
+                        task_id=task_id,
+                        event_type="review.completed" if success else "review.failed",
+                        lifecycle_status="MERGE_READY" if success else "REVIEW_FAILED",
+                        role="reviewer",
+                        summary="Review completed",
+                        candidate_commit=cand_commit,
+                        review_findings={"verdict": "PASS" if success else "FAIL", "findings": result.get("review_findings")},
+                    )
+                if result.get("test_evidence"):
+                    self.store.emit_outbox_event(
+                        task_id=task_id,
+                        event_type="verification.passed" if success else "verification.failed",
+                        lifecycle_status="DONE" if success else "REVIEW_FAILED",
+                        summary="Verification test execution completed",
+                        candidate_commit=cand_commit,
+                        merge_commit=mrg_commit,
+                        test_evidence={"status": "PASSED" if success else "FAILED", "evidence": result.get("test_evidence")},
+                    )
             else:
                 # Fallback standard OrchestrationEngine flow
                 record = engine.create_task(
@@ -367,35 +584,155 @@ class TaskService:
                     raise PolicyViolation("Reviewer cannot be implementer.")
 
                 # Turn 1: Planning
+                self.store.emit_outbox_event(
+                    task_id=task_id,
+                    event_type="planner.started",
+                    lifecycle_status="ACTIVE",
+                    role="planner",
+                    seat_id=planner,
+                    summary=f"Planner turn started by {planner}",
+                )
                 engine.assign_role(task_id, engine=planner, role="planner")
                 p_res = engine.execute_turn(task_id, engine=planner, role="planner", prompt=spec.goal)
                 if p_res.get("status") != "SUCCESS":
                     self.store.update_bridge_task_state(task_id, TaskState.REVIEW_FAILED.value, error="Planning failed")
+                    self.store.emit_outbox_event(
+                        task_id=task_id,
+                        event_type="planner.failed",
+                        lifecycle_status="REVIEW_FAILED",
+                        role="planner",
+                        seat_id=planner,
+                        summary="Planning turn failed",
+                        data={"error": p_res.get("error", "Planning failed")},
+                    )
                     return
+                self.store.emit_outbox_event(
+                    task_id=task_id,
+                    event_type="planner.completed",
+                    lifecycle_status="ACTIVE",
+                    role="planner",
+                    seat_id=planner,
+                    summary=f"Planner turn completed by {planner}",
+                )
 
                 # Turn 2: Implementing
+                self.store.emit_outbox_event(
+                    task_id=task_id,
+                    event_type="implementation.started",
+                    lifecycle_status="ACTIVE",
+                    role="implementer",
+                    seat_id=implementer,
+                    summary=f"Implementation turn started by {implementer}",
+                )
                 engine.assign_role(task_id, engine=implementer, role="implementer")
                 i_res = engine.execute_turn(task_id, engine=implementer, role="implementer", prompt=spec.goal)
                 if i_res.get("status") != "SUCCESS":
                     self.store.update_bridge_task_state(task_id, TaskState.REVIEW_FAILED.value, error="Implementation failed")
+                    self.store.emit_outbox_event(
+                        task_id=task_id,
+                        event_type="implementation.failed",
+                        lifecycle_status="REVIEW_FAILED",
+                        role="implementer",
+                        seat_id=implementer,
+                        summary="Implementation turn failed",
+                        data={"error": i_res.get("error", "Implementation failed")},
+                    )
                     return
 
+                core_rec = engine.tasks.get(task_id)
+                cand_commit = core_rec.candidate_commit if core_rec else None
+                self.store.emit_outbox_event(
+                    task_id=task_id,
+                    event_type="implementation.completed",
+                    lifecycle_status="REVIEW",
+                    role="implementer",
+                    seat_id=implementer,
+                    summary=f"Implementation completed by {implementer}; candidate commit pinned: {cand_commit}",
+                    candidate_commit=cand_commit,
+                )
+
                 # Turn 3: Review
+                self.store.emit_outbox_event(
+                    task_id=task_id,
+                    event_type="review.started",
+                    lifecycle_status="REVIEW",
+                    role="reviewer",
+                    seat_id=reviewer,
+                    summary=f"Review started by {reviewer} on candidate {cand_commit}",
+                    candidate_commit=cand_commit,
+                )
                 engine.assign_role(task_id, engine=reviewer, role="reviewer")
                 r_res = engine.execute_turn(task_id, engine=reviewer, role="reviewer", prompt=spec.goal)
                 if r_res.get("status") != "SUCCESS":
                     self.store.update_bridge_task_state(task_id, TaskState.REVIEW_FAILED.value, error="Review failed")
+                    self.store.emit_outbox_event(
+                        task_id=task_id,
+                        event_type="review.failed",
+                        lifecycle_status="REVIEW_FAILED",
+                        role="reviewer",
+                        seat_id=reviewer,
+                        summary="Review turn rejected candidate commit",
+                        candidate_commit=cand_commit,
+                        review_findings={"verdict": "FAIL", "error": r_res.get("error", "Review rejected")},
+                    )
                     return
+                self.store.emit_outbox_event(
+                    task_id=task_id,
+                    event_type="review.completed",
+                    lifecycle_status="MERGE_READY",
+                    role="reviewer",
+                    seat_id=reviewer,
+                    summary=f"Review verified by {reviewer}",
+                    candidate_commit=cand_commit,
+                    review_findings={"verdict": "PASS"},
+                )
 
                 # Verification gate
+                self.store.emit_outbox_event(
+                    task_id=task_id,
+                    event_type="verification.started",
+                    lifecycle_status="MERGING",
+                    summary="Deterministic verification gate running",
+                    candidate_commit=cand_commit,
+                )
                 v_ok = engine.run_deterministic_verification(task_id)
                 state = TaskState.DONE.value if v_ok else TaskState.REVIEW_FAILED.value
                 error = None if v_ok else "Deterministic verification gate failed."
+                mrg_commit = core_rec.merge_commit if core_rec else None
+
+                if v_ok:
+                    self.store.emit_outbox_event(
+                        task_id=task_id,
+                        event_type="verification.passed",
+                        lifecycle_status="DONE",
+                        summary=f"Verification passed; merged to integration: {mrg_commit}",
+                        candidate_commit=cand_commit,
+                        merge_commit=mrg_commit,
+                        test_evidence={"exit_code": 0, "status": "PASSED"},
+                    )
+                else:
+                    self.store.emit_outbox_event(
+                        task_id=task_id,
+                        event_type="verification.failed",
+                        lifecycle_status="REVIEW_FAILED",
+                        summary="Deterministic verification gate failed",
+                        candidate_commit=cand_commit,
+                        test_evidence={"exit_code": 1, "status": "FAILED"},
+                    )
 
             if self._cancellation_flags.get(task_id):
                 return
 
             self.store.update_bridge_task_state(task_id, state, error=error)
+            self.store.emit_outbox_event(
+                task_id=task_id,
+                event_type="task.done" if state == TaskState.DONE.value else "task.failed",
+                lifecycle_status=state,
+                summary=f"Task {task_id} completed with status {state}",
+                candidate_commit=cand_commit,
+                merge_commit=mrg_commit,
+                data={"state": state, "error": error},
+            )
             self.emitter.emit(
                 "TASK_COMPLETED" if state == TaskState.DONE.value else "TASK_FAILED",
                 task_id=task_id,
@@ -404,6 +741,7 @@ class TaskService:
                 notification_title=f"[Boss Rig] Task {state}",
                 notification_body=f"Task {task_id} finished with state {state}.",
             )
+
 
         except Exception as exc:
             if self._cancellation_flags.get(task_id):

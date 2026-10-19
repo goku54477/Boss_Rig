@@ -84,6 +84,46 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "task_propose",
+        "description": "Propose a scoped task specification without executing it. Returns a reviewable proposal ID and hash requiring explicit human approval.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Absolute path to allowlisted repository"},
+                "goal": {"type": "string", "description": "Scoped feature or bugfix goal"},
+                "verification_commands": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Deterministic test commands to verify candidate commit",
+                },
+                "constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Execution constraints",
+                },
+                "allowed_merge_target": {
+                    "type": "string",
+                    "enum": ["integration"],
+                    "default": "integration",
+                },
+            },
+            "required": ["repo", "goal", "verification_commands"],
+        },
+    },
+    {
+        "name": "task_events",
+        "description": "Fetch ordered execution outbox events and timeline for a task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Task ID"},
+                "after_seq": {"type": "integer", "default": 0, "description": "Fetch events after this sequence number"},
+                "limit": {"type": "integer", "default": 100},
+            },
+            "required": ["task_id"],
+        },
+    },
+    {
         "name": "task_cancel",
         "description": "Cancel an active or queued task safely.",
         "inputSchema": {
@@ -108,17 +148,20 @@ MCP_TOOLS = [
     },
     {
         "name": "task_answer",
-        "description": "Answer a pending question to resume an agent's turn.",
+        "description": "Answer a pending question to resume an agent's turn with strict task binding.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "question_id": {"type": "string", "description": "Question ID"},
                 "answer": {"type": "string", "description": "Operator answer text"},
+                "task_id": {"type": "string", "description": "Task ID for cross-task binding verification"},
+                "conversation_id": {"type": "string", "description": "Conversation ID for binding verification"},
             },
             "required": ["question_id", "answer"],
         },
     },
 ]
+
 
 
 class McpServer:
@@ -182,6 +225,28 @@ class McpServer:
                 )
                 content = json.dumps(res, indent=2)
 
+            elif name == "task_propose":
+                spec = TaskSpec(
+                    repo=args["repo"],
+                    goal=args["goal"],
+                    verification_commands=args["verification_commands"],
+                    constraints=args.get("constraints", []),
+                    allowed_merge_target=args.get("allowed_merge_target", "integration"),
+                )
+                res = self.service.propose_task(
+                    spec=spec,
+                    source="mcp",
+                )
+                content = json.dumps(res, indent=2)
+
+            elif name == "task_events":
+                events = self.service.get_task_events(
+                    task_id=args["task_id"],
+                    after_seq=args.get("after_seq", 0),
+                    limit=args.get("limit", 100),
+                )
+                content = json.dumps({"task_id": args["task_id"], "events": events}, indent=2)
+
             elif name == "task_status":
                 res = self.service.task_status(args["task_id"])
                 content = json.dumps(res, indent=2)
@@ -209,7 +274,12 @@ class McpServer:
                 content = json.dumps(res, indent=2)
 
             elif name == "task_answer":
-                res = self.service.task_answer(args["question_id"], args["answer"])
+                res = self.service.task_answer(
+                    question_id=args["question_id"],
+                    answer=args["answer"],
+                    task_id=args.get("task_id"),
+                    conversation_id=args.get("conversation_id"),
+                )
                 content = json.dumps(res, indent=2)
 
             else:
@@ -218,6 +288,7 @@ class McpServer:
                     "id": msg_id,
                     "error": {"code": -32601, "message": f"Unknown tool '{name}'"},
                 }
+
 
             return {
                 "jsonrpc": "2.0",

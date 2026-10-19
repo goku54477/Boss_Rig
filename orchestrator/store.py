@@ -149,6 +149,52 @@ class TaskStore:
                     created_at REAL NOT NULL,
                     answered_at REAL
                 );
+
+                CREATE TABLE IF NOT EXISTS bridge_approval_nonces (
+                    nonce TEXT PRIMARY KEY,
+                    spec_id TEXT NOT NULL,
+                    repo TEXT NOT NULL,
+                    conversation_id TEXT,
+                    consumed_at REAL NOT NULL,
+                    task_id TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS bridge_task_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    spec_id TEXT NOT NULL,
+                    repo TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL',
+                    source TEXT NOT NULL,
+                    conversation_id TEXT,
+                    message_id TEXT,
+                    approval_token TEXT,
+                    rejection_reason TEXT,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    consumed_at REAL
+                );
+
+                CREATE TABLE IF NOT EXISTS bridge_task_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    event_id TEXT UNIQUE NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    lifecycle_status TEXT NOT NULL,
+                    role TEXT,
+                    seat_id TEXT,
+                    summary TEXT NOT NULL DEFAULT '',
+                    attempt INTEGER DEFAULT 1,
+                    data_json TEXT,
+                    candidate_commit TEXT,
+                    merge_commit TEXT,
+                    review_findings_json TEXT,
+                    test_evidence_json TEXT,
+                    created_at REAL NOT NULL,
+                    UNIQUE(task_id, seq)
+                );
                 """
             )
 
@@ -817,4 +863,267 @@ class TaskStore:
                 "created_at": row["created_at"],
                 "answered_at": now,
             }
+
+    # -------------------------------------------------------------
+    # Milestone M1: Nonce management & single-use consumption
+    # -------------------------------------------------------------
+    def consume_approval_nonce(
+        self,
+        nonce: str,
+        spec_id: str,
+        repo: str,
+        conversation_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> bool:
+        """Atomically insert approval nonce into bridge_approval_nonces. Returns True if fresh, False if already consumed."""
+        now = time.time()
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO bridge_approval_nonces (
+                        nonce, spec_id, repo, conversation_id, consumed_at, task_id
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (nonce, spec_id, repo, conversation_id, now, task_id),
+                )
+                return cur.rowcount > 0
+        except sqlite3.IntegrityError:
+            if task_id:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT task_id FROM bridge_approval_nonces WHERE nonce = ?", (nonce,)
+                    ).fetchone()
+                    if row and row["task_id"] == task_id:
+                        return True
+            return False
+
+    def is_nonce_consumed(self, nonce: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT nonce FROM bridge_approval_nonces WHERE nonce = ?", (nonce,)
+            ).fetchone()
+            return row is not None
+
+    # -------------------------------------------------------------
+    # Milestone M3: Task Proposals storage & lifecycle
+    # -------------------------------------------------------------
+    def save_proposal(
+        self,
+        proposal_id: str,
+        spec_id: str,
+        repo: str,
+        goal: str,
+        spec_dict: Dict[str, Any],
+        status: str = "PENDING_APPROVAL",
+        source: str = "conversational",
+        conversation_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+        approval_token: Optional[str] = None,
+        expires_at: Optional[float] = None,
+    ) -> None:
+        now = time.time()
+        exp = expires_at or (now + 3600.0)
+        spec_json = json.dumps(spec_dict)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO bridge_task_proposals (
+                    proposal_id, spec_id, repo, goal, spec_json, status,
+                    source, conversation_id, message_id, approval_token,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    spec_id = excluded.spec_id,
+                    repo = excluded.repo,
+                    goal = excluded.goal,
+                    spec_json = excluded.spec_json,
+                    status = excluded.status,
+                    approval_token = excluded.approval_token,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    proposal_id, spec_id, repo, goal, spec_json, status,
+                    source, conversation_id, message_id, approval_token,
+                    now, exp,
+                ),
+            )
+
+    def get_proposal(self, proposal_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM bridge_task_proposals WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "proposal_id": row["proposal_id"],
+                "spec_id": row["spec_id"],
+                "repo": row["repo"],
+                "goal": row["goal"],
+                "spec": json.loads(row["spec_json"]) if row["spec_json"] else {},
+                "status": row["status"],
+                "source": row["source"],
+                "conversation_id": row["conversation_id"],
+                "message_id": row["message_id"],
+                "approval_token": row["approval_token"],
+                "rejection_reason": row["rejection_reason"],
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "consumed_at": row["consumed_at"],
+            }
+
+    def list_proposals(
+        self, status: Optional[str] = None, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            query = "SELECT * FROM bridge_task_proposals"
+            params: List[Any] = []
+            if status:
+                query += " WHERE status = ?"
+                params.append(status)
+            query += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
+            return [
+                {
+                    "proposal_id": r["proposal_id"],
+                    "spec_id": r["spec_id"],
+                    "repo": r["repo"],
+                    "goal": r["goal"],
+                    "spec": json.loads(r["spec_json"]) if r["spec_json"] else {},
+                    "status": r["status"],
+                    "source": r["source"],
+                    "conversation_id": r["conversation_id"],
+                    "message_id": r["message_id"],
+                    "approval_token": r["approval_token"],
+                    "rejection_reason": r["rejection_reason"],
+                    "created_at": r["created_at"],
+                    "expires_at": r["expires_at"],
+                    "consumed_at": r["consumed_at"],
+                }
+                for r in rows
+            ]
+
+    def update_proposal_status(
+        self,
+        proposal_id: str,
+        status: str,
+        rejection_reason: Optional[str] = None,
+        approval_token: Optional[str] = None,
+    ) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            consumed = now if status == "CONSUMED" else None
+            conn.execute(
+                """
+                UPDATE bridge_task_proposals
+                SET status = ?,
+                    rejection_reason = COALESCE(?, rejection_reason),
+                    approval_token = COALESCE(?, approval_token),
+                    consumed_at = COALESCE(?, consumed_at)
+                WHERE proposal_id = ?
+                """,
+                (status, rejection_reason, approval_token, consumed, proposal_id),
+            )
+
+    # -------------------------------------------------------------
+    # Milestone M2: Ordered Task Event Outbox
+    # -------------------------------------------------------------
+    def emit_outbox_event(
+        self,
+        task_id: str,
+        event_type: str,
+        lifecycle_status: str,
+        role: Optional[str] = None,
+        seat_id: Optional[str] = None,
+        summary: str = "",
+        attempt: int = 1,
+        data: Optional[Dict[str, Any]] = None,
+        candidate_commit: Optional[str] = None,
+        merge_commit: Optional[str] = None,
+        review_findings: Optional[Dict[str, Any]] = None,
+        test_evidence: Optional[Dict[str, Any]] = None,
+        event_id: Optional[str] = None,
+    ) -> int:
+        """Append ordered event to bridge_task_outbox with monotonically increasing sequence number."""
+        now = time.time()
+        data_json = json.dumps(data or {})
+        rf_json = json.dumps(review_findings) if review_findings else None
+        te_json = json.dumps(test_evidence) if test_evidence else None
+
+        with self._connect() as conn:
+            # Query current max seq for this task
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM bridge_task_outbox WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            seq = int(row["max_seq"]) + 1
+            evt_id = event_id or f"evt-{task_id}-{seq}-{int(now * 1000)}"
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO bridge_task_outbox (
+                        task_id, event_id, seq, event_type, lifecycle_status,
+                        role, seat_id, summary, attempt, data_json,
+                        candidate_commit, merge_commit, review_findings_json,
+                        test_evidence_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id, evt_id, seq, event_type, lifecycle_status,
+                        role, seat_id, summary, attempt, data_json,
+                        candidate_commit, merge_commit, rf_json,
+                        te_json, now,
+                    ),
+                )
+                return seq
+            except sqlite3.IntegrityError:
+                # Duplicate event_id or sequence: fetch existing
+                existing = conn.execute(
+                    "SELECT seq FROM bridge_task_outbox WHERE event_id = ?", (evt_id,)
+                ).fetchone()
+                return int(existing["seq"]) if existing else seq
+
+    def get_task_outbox_events(
+        self,
+        task_id: str,
+        after_seq: int = 0,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Fetch ordered events for task_id starting after after_seq."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM bridge_task_outbox
+                WHERE task_id = ? AND seq > ?
+                ORDER BY seq ASC
+                LIMIT ?
+                """,
+                (task_id, after_seq, limit),
+            ).fetchall()
+            return [
+                {
+                    "id": r["id"],
+                    "task_id": r["task_id"],
+                    "event_id": r["event_id"],
+                    "seq": r["seq"],
+                    "event_type": r["event_type"],
+                    "lifecycle_status": r["lifecycle_status"],
+                    "role": r["role"],
+                    "seat_id": r["seat_id"],
+                    "summary": r["summary"],
+                    "attempt": r["attempt"],
+                    "data": json.loads(r["data_json"]) if r["data_json"] else {},
+                    "candidate_commit": r["candidate_commit"],
+                    "merge_commit": r["merge_commit"],
+                    "review_findings": json.loads(r["review_findings_json"]) if r["review_findings_json"] else None,
+                    "test_evidence": json.loads(r["test_evidence_json"]) if r["test_evidence_json"] else None,
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ]
+
 

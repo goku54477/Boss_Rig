@@ -54,10 +54,16 @@ def create_approval_token(
     conversation_id: str,
     message_id: str,
     secret_key: str,
+    nonce: Optional[str] = None,
+    expires_at: Optional[float] = None,
+    allowed_actions: Optional[list[str]] = None,
 ) -> str:
-    """Generate cryptographic HMAC signature proving trusted user approval from chat."""
+    """Generate cryptographic HMAC signature proving trusted user approval from chat or local UI."""
     canon_repo = str(normalize_repo_path(repo)).lower()
-    payload = f"{spec_id.lower()}|{canon_repo}|{conversation_id}|{message_id}"
+    nonce_val = nonce or ""
+    exp_val = f"{expires_at:.0f}" if expires_at is not None else ""
+    actions_val = ",".join(sorted(allowed_actions or ["execute_local"]))
+    payload = f"{spec_id.lower()}|{canon_repo}|{conversation_id}|{message_id}|{nonce_val}|{exp_val}|{actions_val}"
     digest = hmac.new(secret_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"sig-{digest[:32]}"
 
@@ -69,10 +75,24 @@ def verify_approval_token(
     conversation_id: str,
     message_id: str,
     secret_key: str,
+    nonce: Optional[str] = None,
+    expires_at: Optional[float] = None,
+    allowed_actions: Optional[list[str]] = None,
 ) -> bool:
     """Verify approval token matches expected HMAC."""
-    expected = create_approval_token(spec_id, repo, conversation_id, message_id, secret_key)
-    return hmac.compare_digest(token.strip(), expected)
+    if expires_at is not None and time.time() > expires_at:
+        return False
+    # Try with extended nonce/expiry/actions payload first
+    expected_extended = create_approval_token(
+        spec_id, repo, conversation_id, message_id, secret_key,
+        nonce=nonce, expires_at=expires_at, allowed_actions=allowed_actions
+    )
+    if hmac.compare_digest(token.strip(), expected_extended):
+        return True
+    # Fallback to legacy payload format without nonce/expiry for backwards compatibility
+    expected_legacy = create_approval_token(spec_id, repo, conversation_id, message_id, secret_key)
+    return hmac.compare_digest(token.strip(), expected_legacy)
+
 
 
 def is_pid_alive(pid: int) -> bool:

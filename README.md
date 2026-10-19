@@ -527,6 +527,31 @@ For detailed daily operational walkthroughs, see the **[Operator Guide](docs/OPE
 
 ---
 
+## 🌐 Conversational Control Bridge & Companion Inbox (v0.2)
+
+Boss Rig includes an approval-gated conversational task bridge connecting **Goldfish Desktop**, **Boss Rig TaskService**, and external clients such as **ChatGPT**:
+
+- **Discuss & Scope**: Discuss requirements naturally in Goldfish Desktop or ChatGPT (`@boss-rig scope a task to...`). Proposals are staged in `PENDING_APPROVAL` without executing code.
+- **Cryptographic Human Approval**: Tasks require explicit approval bound to the canonical SHA-256 spec hash, verified with single-use cryptographic nonces to prevent replay and forgery attacks.
+- **Operator Companion Inbox Dashboard**: Local browser UI at `http://127.0.0.1:8383/inbox` for one-click proposal review, interactive agent question answering, and real-time execution timeline monitoring.
+- **Durable Event Outbox**: Strictly monotonic per-task timeline sequencing (`bridge_task_outbox`) tracking task progression and full candidate/merge commit evidence.
+- **External Client Adapters**: OpenAPI 3.1 action definitions and reverse-proxy architecture for ChatGPT Custom Actions. See **[ChatGPT Adapter Guide](docs/CHATGPT_ADAPTER.md)**.
+
+### Launching the Bridge Services
+
+```bash
+# Start the Local Task Server & Companion Inbox UI (http://127.0.0.1:8383/inbox)
+python -m orchestrator.bridge_cli serve --port 8383
+
+# Start the Goldfish Desktop Chat Watcher in safe dry-run mode
+python -m orchestrator.bridge_cli watch
+
+# Enable live automated dispatch
+python -m orchestrator.bridge_cli watch --live
+```
+
+---
+
 ## 📊 Live Verification Reports & Evidence
 
 All multi-agent capabilities are proven against real models in isolated Git worktrees:

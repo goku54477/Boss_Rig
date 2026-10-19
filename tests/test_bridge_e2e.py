@@ -177,12 +177,27 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             allowed_merge_target="integration",
         )
 
-    def _create_operator_approval(self, spec: TaskSpec) -> ApprovalRecord:
+    def _create_operator_approval(self, spec: TaskSpec, nonce: Optional[str] = None) -> ApprovalRecord:
+        from orchestrator.server import get_or_create_auth_token
+        from orchestrator.security import create_approval_token
+        secret = get_or_create_auth_token()
+        token = create_approval_token(
+            spec_id=spec.compute_hash(),
+            repo=spec.repo,
+            conversation_id="cli",
+            message_id="cli",
+            secret_key=secret,
+            nonce=nonce,
+        )
         return ApprovalRecord(
             spec_id=spec.compute_hash(),
             repo=spec.repo,
             source="operator_cli",
             approved_by="operator",
+            conversation_id="cli",
+            message_id="cli",
+            approval_token=token,
+            nonce=nonce,
         )
 
     # --- Test 1: Full pipeline pass ---

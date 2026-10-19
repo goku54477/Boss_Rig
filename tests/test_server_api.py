@@ -109,6 +109,16 @@ class TestTaskServerAPI(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 403)
 
         # 2. Submission with valid operator approval record succeeds
+        from orchestrator.server import get_or_create_auth_token
+        from orchestrator.security import create_approval_token
+        secret = get_or_create_auth_token()
+        token = create_approval_token(
+            spec_id=spec_hash,
+            repo=str(self.dummy_repo),
+            conversation_id="cli",
+            message_id="cli",
+            secret_key=secret,
+        )
         valid_payload = {
             "spec": spec.to_canonical_dict(),
             "idempotency_key": "api-idem-1",
@@ -119,6 +129,7 @@ class TestTaskServerAPI(unittest.TestCase):
                 "repo": str(self.dummy_repo),
                 "source": "operator_cli",
                 "approved_by": "operator",
+                "approval_token": token,
             },
         }
         res = self._request("POST", "/tasks/submit", data=valid_payload)

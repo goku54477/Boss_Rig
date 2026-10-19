@@ -27,6 +27,11 @@ SPEC_BLOCK_PATTERN = re.compile(
     r"```(?:boss-rig-spec|json)\s*\n(\{.*?\})\n```",
     re.DOTALL | re.IGNORECASE,
 )
+PROPOSE_PATTERN = re.compile(
+    r"(?:@boss-rig\s+(?:propose|scope)|boss\s+rig[,\s]+(?:scope|propose|prepare))\s+(?:a\s+task\s+to\s+)?(.+)",
+    re.IGNORECASE,
+)
+
 
 
 def resolve_goldfish_chats_dir() -> Optional[Path]:
@@ -198,6 +203,14 @@ class ChatWatcher:
                 results.append(res)
                 continue
 
+            # Check for conversational proposal command (e.g. "@boss-rig scope a task to...")
+            propose_match = PROPOSE_PATTERN.search(sanitized)
+            if propose_match:
+                res = self._handle_propose(chat_id, msg_id, msg, propose_match)
+                results.append(res)
+                continue
+
+
         return results
 
     def _handle_approval(
@@ -350,7 +363,58 @@ class ChatWatcher:
         )
 
         try:
-            res = self.service.task_answer(question_id, answer_text)
+            res = self.service.task_answer(
+                question_id=question_id,
+                answer=answer_text,
+                task_id=task_id,
+                conversation_id=chat_id,
+            )
             return {"message_id": msg_id, "status": "ANSWER_ACCEPTED", "result": res}
         except Exception as exc:
             return {"message_id": msg_id, "status": "ANSWER_REJECTED", "error": str(exc)}
+
+    def _handle_propose(
+        self, chat_id: str, msg_id: str, msg: Dict[str, Any], match: re.Match[str]
+    ) -> Dict[str, Any]:
+        """Handle conversational task scoping/proposal creation without execution permission."""
+        raw_goal = match.group(1).strip()
+        created_at = msg.get("createdAt")
+
+        # Infer repo if specified in goal (e.g. "repo=/path/to/repo" or default to first allowed repo or current directory)
+        repo_match = re.search(r"repo=[\"']?([^\"'\s]+)[\"']?", raw_goal, re.IGNORECASE)
+        if repo_match:
+            repo_path = repo_match.group(1).strip()
+            goal_clean = raw_goal.replace(repo_match.group(0), "").strip()
+        else:
+            default_repo = self.service.extra_allowed_repos[0] if self.service.extra_allowed_repos else os.getcwd()
+            repo_path = str(default_repo)
+            goal_clean = raw_goal
+
+        spec = TaskSpec(
+            repo=repo_path,
+            goal=goal_clean,
+            verification_commands=["python -m unittest"],
+            allowed_merge_target="integration",
+        )
+
+        try:
+            prop_res = self.service.propose_task(
+                spec=spec,
+                source="goldfish_chat",
+                conversation_id=chat_id,
+                message_id=msg_id,
+            )
+            self.service.store.claim_event_durable(
+                event_id=msg_id,
+                chat_id=chat_id,
+                message_created_at=created_at,
+                spec_id=prop_res["spec_id"],
+                repo_path=repo_path,
+                action="PROPOSE",
+                status="PROPOSED",
+                detail=f"Proposal created: {prop_res['proposal_id']}",
+            )
+            return {"message_id": msg_id, "status": "PROPOSED", "result": prop_res}
+        except Exception as exc:
+            return {"message_id": msg_id, "status": "PROPOSE_REJECTED", "error": str(exc)}
+

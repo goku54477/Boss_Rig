@@ -160,15 +160,17 @@ class OrchestrationEngine:
         status = event.get("status", "ERROR")
 
         if status == "SUCCESS":
-            # Record current candidate commit from worktree
-            rev_res = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=seat_wt,
-                capture_output=True,
-                text=True,
-            )
-            if rev_res.returncode == 0:
-                task.candidate_commit = rev_res.stdout.strip()
+            # Record current candidate commit from worktree ONLY for implementer role!
+            # Reviewers or planners must never overwrite the candidate commit.
+            if role == "implementer":
+                rev_res = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=seat_wt,
+                    capture_output=True,
+                    text=True,
+                )
+                if rev_res.returncode == 0:
+                    task.candidate_commit = rev_res.stdout.strip()
 
             # Invariant: Agent completion NEVER transitions directly to DONE!
             # It only transitions to REVIEW!
@@ -195,7 +197,9 @@ class OrchestrationEngine:
     ) -> bool:
         """Run the deterministic verification supervisor and merge to integration."""
         task = self.tasks[task_id]
-        seat = seat_id or task.assigned_engine or "opencode-1"
+        # Invariant: verification must evaluate the implementer seat worktree, never the reviewer seat
+        seat = seat_id or task.implementer or task.assigned_engine or "opencode-1"
+
 
         PolicyEngine.assert_commit_pinned(task)
         PolicyEngine.assert_valid_state_transition(task.state, TaskState.MERGE_READY)
