@@ -7,6 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from unittest.mock import patch
+
+from orchestrator.store import TaskStore
+from plane.adapters.listeners import GoldfishChatListener, JsonlBusListener
 from plane.config import PlaneConfig
 from plane.router import HeuristicRouter, LayaRouter, create_router
 from plane.schemas import BuildReport, PlaneMessage, RoutingDecision
@@ -312,6 +316,160 @@ class TestPlaneRouters(unittest.TestCase):
             text="@rig status",
         )
         self.assertEqual(router.classify(status_msg).action, "CHECK_STATUS")
+
+
+class TestPlaneListeners(unittest.TestCase):
+    def test_goldfish_listener_baselines_old_messages_and_catches_new_user_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            chats_dir = Path(tmp) / "chats"
+            chats_dir.mkdir()
+            chat_file = chats_dir / "chat-1.json"
+            chat_data = {
+                "id": "chat-1",
+                "createdAt": 1700000000000,
+                "updatedAt": 1700000001000,
+                "messages": [
+                    {"id": "old-u1", "role": "user", "content": "Build an old tool"},
+                    {"id": "old-a1", "role": "assistant", "content": "Here is how."},
+                ],
+            }
+            chat_file.write_text(json.dumps(chat_data), encoding="utf-8")
+
+            store = TaskStore(db_path=Path(tmp) / "tasks.sqlite")
+            listener = GoldfishChatListener(chats_dir=chats_dir, store=store)
+            baselined = listener.baseline()
+            self.assertEqual(baselined, 2)
+            self.assertEqual(listener.poll(), [])
+
+            # Append assistant reply, report marker, and a new user turn
+            chat_data["messages"].extend(
+                [
+                    {"id": "new-a2", "role": "assistant", "content": "Build a calculator"},
+                    {
+                        "id": "new-u-report",
+                        "role": "user",
+                        "content": "[SHARED PLANE REPORT — T-1 — DONE] Built calculator",
+                    },
+                    {
+                        "id": "new-u2",
+                        "role": "user",
+                        "content": "I want to build a CLI calculator in Python",
+                    },
+                ]
+            )
+            before_write_bytes = json.dumps(chat_data).encode("utf-8")
+            chat_file.write_bytes(before_write_bytes)
+            mtime_before = chat_file.stat().st_mtime_ns
+
+            msgs = listener.poll()
+            self.assertEqual(len(msgs), 1)
+            self.assertEqual(msgs[0].id, "new-u2")
+            self.assertEqual(msgs[0].source, "goldfish")
+            self.assertEqual(msgs[0].conversation_id, "chat-1")
+            self.assertEqual(msgs[0].role, "user")
+            self.assertIn("CLI calculator", msgs[0].text)
+            self.assertTrue(len(msgs[0].recent_context) >= 1)
+            self.assertLessEqual(len(msgs[0].recent_context), 3)
+
+            # Deduplicated on next poll, and Goldfish file untouched
+            self.assertEqual(listener.poll(), [])
+            self.assertEqual(chat_file.read_bytes(), before_write_bytes)
+            self.assertEqual(chat_file.stat().st_mtime_ns, mtime_before)
+
+    def test_goldfish_listener_skips_inbox_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            chats_dir = Path(tmp) / "chats"
+            chats_dir.mkdir()
+            (chats_dir / "inbox.json").write_text(
+                json.dumps(
+                    {
+                        "id": "inbox",
+                        "messages": [
+                            {"id": "inbox-1", "role": "user", "content": "Build a secret"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = TaskStore(db_path=Path(tmp) / "tasks.sqlite")
+            listener = GoldfishChatListener(chats_dir=chats_dir, store=store)
+            self.assertEqual(listener.baseline(), 0)
+            self.assertEqual(listener.poll(), [])
+
+    def test_goldfish_listener_survives_partial_json_write_and_permission_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            chats_dir = Path(tmp) / "chats"
+            chats_dir.mkdir()
+            chat_file = chats_dir / "chat-partial.json"
+            chat_file.write_text("{invalid json truncated", encoding="utf-8")
+
+            store = TaskStore(db_path=Path(tmp) / "tasks.sqlite")
+            listener = GoldfishChatListener(chats_dir=chats_dir, store=store)
+            self.assertEqual(listener.poll(), [])
+
+            # Simulate PermissionError while Goldfish holds the file lock
+            chat_file.write_text(
+                json.dumps(
+                    {
+                        "id": "chat-partial",
+                        "messages": [{"id": "m-ok", "role": "user", "content": "Build a parser"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(Path, "read_text", side_effect=PermissionError("locked")):
+                self.assertEqual(listener.poll(), [])
+
+            # Next poll after lock clears recovers the message
+            msgs = listener.poll()
+            self.assertEqual(len(msgs), 1)
+            self.assertEqual(msgs[0].id, "m-ok")
+
+    def test_jsonl_bus_listener_ingests_external_brain_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bus_path = Path(tmp) / "bus.jsonl"
+            bus_path.write_text(
+                json.dumps({"id": "bus-old", "role": "user", "source": "claude_desktop", "text": "Old"})
+                + "\n",
+                encoding="utf-8",
+            )
+            store = TaskStore(db_path=Path(tmp) / "tasks.sqlite")
+            listener = JsonlBusListener(bus_path=bus_path, store=store)
+            self.assertEqual(listener.baseline(), 1)
+
+            with open(bus_path, "a", encoding="utf-8") as f:
+                f.write("{corrupt-line\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "id": "bus-asst",
+                            "role": "assistant",
+                            "source": "claude_desktop",
+                            "text": "I can build a timer",
+                        }
+                    )
+                    + "\n"
+                )
+                f.write(
+                    json.dumps(
+                        {
+                            "id": "bus-1",
+                            "role": "user",
+                            "source": "claude_desktop",
+                            "conversation_id": "conv-cd",
+                            "text": "Build a timer",
+                        }
+                    )
+                    + "\n"
+                )
+
+            msgs = listener.poll()
+            self.assertEqual(len(msgs), 1)
+            self.assertEqual(msgs[0].id, "bus-1")
+            self.assertEqual(msgs[0].source, "claude_desktop")
+            self.assertEqual(msgs[0].conversation_id, "conv-cd")
+            self.assertEqual(msgs[0].text, "Build a timer")
+            self.assertEqual(listener.poll(), [])
 
 
 if __name__ == "__main__":
