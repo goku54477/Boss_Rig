@@ -42,4 +42,5 @@ success_*.txt
 feature_*.py
 soak_gate_proof.txt
 .openrig-opencode-seat.log
+docs/superpowers/
 

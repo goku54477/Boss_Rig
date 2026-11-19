@@ -400,13 +400,68 @@ class SharedPlaneDaemon:
 
     def run_forever(self) -> None:
         """Baseline existing state and continuously poll Shared Plane listeners."""
-        self.baseline()
+        counts = self.baseline()
+        print(
+            f"[SHARED PLANE] Started (dispatch={self.config.dispatch_mode}, "
+            f"dry_run={self.dry_run}, router={self.config.router_mode}, "
+            f"baselined={counts})",
+            flush=True,
+        )
         try:
             while True:
-                self.step_once()
+                actions = self.step_once()
+                if actions:
+                    print(f"[SHARED PLANE] {actions}", flush=True)
                 time.sleep(max(0.1, self.config.poll_interval_sec))
         except KeyboardInterrupt:
             return
+
+
+def _check_sandbox_repo(sandbox_path: Path) -> Tuple[str, str]:
+    """Verify sandbox_path has a clean `integration` branch or linked worktree."""
+    if not sandbox_path.exists():
+        return "WARN", f"default_repo does not exist: {sandbox_path}"
+
+    try:
+        porcelain = subprocess.check_output(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=sandbox_path,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        current_wt: Optional[Path] = None
+        integration_wt: Optional[Path] = None
+        for line in porcelain.splitlines():
+            if line.startswith("worktree "):
+                current_wt = Path(line[len("worktree ") :].strip())
+            elif line.strip() == "branch refs/heads/integration" and current_wt is not None:
+                integration_wt = current_wt
+                break
+
+        if integration_wt is not None:
+            dirty = subprocess.check_output(
+                ["git", "status", "--porcelain"],
+                cwd=integration_wt,
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            ).strip()
+            if not dirty:
+                return "PASS", f"{sandbox_path} (integration worktree clean at {integration_wt})"
+            return "WARN", f"{sandbox_path} (integration worktree dirty at {integration_wt})"
+
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=sandbox_path,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        st = "PASS" if branch == "integration" else "WARN"
+        return st, f"{sandbox_path} (branch={branch})"
+    except Exception as exc:
+        return "WARN", f"{sandbox_path} (git worktree probe failed: {exc})"
 
 
 def _check_wsl_openrig() -> Tuple[str, str]:
@@ -520,29 +575,8 @@ def run_doctor(config: PlaneConfig, store: Optional[TaskStore] = None) -> List[D
     checks.append({"name": "openrig_wsl", "status": wsl_status, "detail": wsl_detail})
 
     sandbox_path = resolve_repo_path(config.default_repo)
-    if sandbox_path.exists():
-        try:
-            branch = subprocess.check_output(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=sandbox_path,
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            ).strip()
-            st = "PASS" if branch == "integration" else "WARN"
-            detail = f"{sandbox_path} (branch={branch})"
-        except Exception as exc:
-            st = "WARN"
-            detail = f"{sandbox_path} (git branch probe failed: {exc})"
-        checks.append({"name": "sandbox_repo", "status": st, "detail": detail})
-    else:
-        checks.append(
-            {
-                "name": "sandbox_repo",
-                "status": "WARN",
-                "detail": f"default_repo does not exist: {sandbox_path}",
-            }
-        )
+    sb_status, sb_detail = _check_sandbox_repo(sandbox_path)
+    checks.append({"name": "sandbox_repo", "status": sb_status, "detail": sb_detail})
 
     try:
         active_store = store or TaskStore()

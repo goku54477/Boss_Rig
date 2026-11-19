@@ -1077,6 +1077,27 @@ class TestSharedPlaneDaemonE2E(unittest.TestCase):
             self.assertTrue(all("name" in c and "status" in c and "detail" in c for c in checks))
             self.assertEqual(sample.stat().st_mtime_ns, mtime_before)
 
+    def test_doctor_passes_sandbox_repo_with_linked_integration_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo_dir = tmp_path / ".disposable-live-repo"
+            _init_git_repo(repo_dir)
+            # Switch root repo to main and put integration in linked .worktrees/_integration
+            subprocess.run(["git", "checkout", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+            int_wt = repo_dir / ".worktrees" / "_integration"
+            subprocess.run(
+                ["git", "worktree", "add", str(int_wt), "integration"],
+                cwd=repo_dir,
+                check=True,
+                capture_output=True,
+            )
+            cfg = PlaneConfig(default_repo=str(repo_dir))
+            with patch("plane.daemon._check_wsl_openrig", return_value=("PASS", "0.7.19")):
+                checks = run_doctor(cfg, store=TaskStore(db_path=tmp_path / "doc.sqlite"))
+            sb_check = next(c for c in checks if c["name"] == "sandbox_repo")
+            self.assertEqual(sb_check["status"], "PASS")
+            self.assertIn("integration", sb_check["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()
