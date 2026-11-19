@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -14,7 +16,8 @@ from unittest.mock import patch
 from orchestrator.event_emitter import EventEmitter
 from orchestrator.mcp_server import McpServer
 from orchestrator.models import TaskSpec
-from orchestrator.server import TaskServer
+from orchestrator.security import create_approval_token
+from orchestrator.server import TaskServer, get_or_create_auth_token
 from orchestrator.store import TaskStore
 from orchestrator.task_service import TaskService
 from plane.adapters.listeners import GoldfishChatListener, JsonlBusListener
@@ -23,7 +26,8 @@ from plane.adapters.speaker import (
     ReportFileSpeaker,
     ToastNotificationSpeaker,
 )
-from plane.config import PlaneConfig
+from plane.config import PlaneConfig, _fallback_parse_yaml
+from plane.daemon import SharedPlaneDaemon, SpecBuilder, run_doctor
 from plane.router import HeuristicRouter, LayaRouter, create_router
 from plane.schemas import BuildReport, PlaneMessage, RoutingDecision
 
@@ -697,6 +701,381 @@ class TestPlaneSpeakerAndReadback(unittest.TestCase):
                 self.assertEqual(approved["spec_id"], spec.compute_hash())
             finally:
                 server.stop()
+
+
+def _init_git_repo(repo_dir: Path) -> None:
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "integration"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True)
+    (repo_dir / "README.md").write_text("# Sandbox\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True, capture_output=True)
+
+
+class FakeDaemonEngine:
+    """Offline mock engine making a real commit in temp git repo."""
+
+    def __init__(self) -> None:
+        self.invoked_agents = []
+
+    def execute_bridge_task(self, task_id: str, spec: TaskSpec, ask_user_fn, cancel_check_fn):
+        repo_dir = Path(spec.repo)
+        self.invoked_agents.append(dict(spec.assigned_agents))
+        target_file = repo_dir / "calc.py"
+        target_file.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        subprocess.run(["git", "add", "calc.py"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", f"Implement {task_id}"], cwd=repo_dir, check=True, capture_output=True)
+        cand_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+        return {
+            "success": True,
+            "candidate_commit": cand_sha,
+            "merge_commit": cand_sha,
+            "review_findings": f"Approved by {spec.assigned_agents.get('reviewer')}",
+            "test_evidence": "2/2 passed",
+        }
+
+
+class TestSharedPlaneDaemonE2E(unittest.TestCase):
+    def test_fallback_yaml_parser_handles_block_lists(self) -> None:
+        raw = "\n".join(
+            [
+                "router:",
+                "  mode: heuristic",
+                "  prefix_triggers:",
+                "    - '@rig'",
+                "    - 'build a'",
+                "agents:",
+                "  enabled:",
+                "    - opencode-1",
+                "    - codex-1",
+                "    - antigravity-1",
+            ]
+        )
+        parsed = _fallback_parse_yaml(raw)
+        self.assertEqual(parsed["router"]["mode"], "heuristic")
+        self.assertEqual(parsed["router"]["prefix_triggers"], ["@rig", "build a"])
+        self.assertEqual(parsed["agents"]["enabled"], ["opencode-1", "codex-1", "antigravity-1"])
+
+    def test_daemon_e2e_natural_goldfish_chat_to_proposal_and_speaker_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sandbox_repo = tmp_path / ".disposable-live-repo"
+            _init_git_repo(sandbox_repo)
+            chats_dir = tmp_path / "chats"
+            chats_dir.mkdir()
+            chat_file = chats_dir / "conv-1.json"
+            chat_file.write_text(
+                json.dumps(
+                    {
+                        "id": "conv-1",
+                        "messages": [{"id": "old-1", "role": "user", "content": "hi"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            reports_dir = tmp_path / "reports"
+            store = TaskStore(db_path=tmp_path / "tasks.sqlite")
+            emitter = EventEmitter(log_path=tmp_path / "events.jsonl", enable_notifications=False)
+            mock_engine = FakeDaemonEngine()
+            service = TaskService(
+                store=store,
+                event_emitter=emitter,
+                engine_factory=lambda: mock_engine,
+                extra_allowed_repos=[sandbox_repo],
+                dry_run=False,
+            )
+            cfg = PlaneConfig(
+                router_mode="laya",
+                dispatch_mode="propose_first",
+                default_repo=str(sandbox_repo),
+                sandbox_repos=[str(sandbox_repo)],
+                enabled_agents=["opencode-1", "codex-1", "antigravity-1"],
+                reports_dir=str(reports_dir),
+            )
+            fake_laya = FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"type": "noul", "noul": 0.93},
+                        "action": {"type": "choice", "choice": "PROPOSE_BUILD"},
+                        "target_agent": {"type": "choice", "choice": "codex-1"},
+                    }
+                }
+            )
+            router = LayaRouter(threshold=0.75, enabled_agents=cfg.enabled_agents, backend=fake_laya)
+            listener = GoldfishChatListener(chats_dir=chats_dir, store=store)
+            speaker = ReportFileSpeaker(reports_dir=reports_dir)
+            daemon = SharedPlaneDaemon(
+                config=cfg,
+                service=service,
+                listeners=[listener],
+                router=router,
+                speaker=speaker,
+                dry_run=False,
+            )
+            daemon.baseline()
+
+            # Append natural chat turn
+            chat_file.write_text(
+                json.dumps(
+                    {
+                        "id": "conv-1",
+                        "messages": [
+                            {"id": "old-1", "role": "user", "content": "hi"},
+                            {
+                                "id": "new-1",
+                                "role": "user",
+                                "content": "I want to build a calculator in python",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            actions = daemon.step_once()
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["status"], "PROPOSED")
+            self.assertEqual(len(mock_engine.invoked_agents), 0)
+
+            proposals = service.list_proposals(status="PENDING_APPROVAL")
+            self.assertEqual(len(proposals), 1)
+            prop = proposals[0]
+            assigned = prop["spec"]["assigned_agents"]
+            self.assertEqual(assigned["implementer"], "codex-1")
+            self.assertNotEqual(assigned["reviewer"], "codex-1")
+
+            # Approve proposal and wait for completion
+            spec_dict = prop["spec"]
+            spec = TaskSpec(
+                repo=spec_dict["repo"],
+                goal=spec_dict["goal"],
+                verification_commands=spec_dict["verification_commands"],
+                constraints=spec_dict.get("constraints", []),
+                acceptance_criteria=spec_dict.get("acceptance_criteria", []),
+                allowed_merge_target=spec_dict["allowed_merge_target"],
+                assigned_agents=assigned,
+            )
+            secret = get_or_create_auth_token()
+            tok = create_approval_token(
+                spec_id=prop["spec_id"],
+                repo=prop["repo"],
+                conversation_id="inbox",
+                message_id=prop["proposal_id"],
+                secret_key=secret,
+                nonce="n-prop-1",
+                allowed_actions=["execute_local"],
+            )
+            sub_res = service.task_submit(
+                spec=spec,
+                idempotency_key=f"prop-{prop['proposal_id']}",
+                approved=True,
+                approved_hash=prop["spec_id"],
+                approval_record={
+                    "spec_id": prop["spec_id"],
+                    "repo": prop["repo"],
+                    "source": "local_web",
+                    "conversation_id": "inbox",
+                    "message_id": prop["proposal_id"],
+                    "approval_token": tok,
+                    "nonce": "n-prop-1",
+                    "allowed_actions": ["execute_local"],
+                },
+            )
+            service.wait_all(timeout_sec=5.0)
+            task_id = sub_res["task_id"]
+            self.assertEqual(service.task_status(task_id)["state"], "DONE")
+
+            # Speaker emits report once
+            report_actions = daemon.step_once()
+            self.assertTrue(
+                any(a["action"] == "REPORT_SPOKEN" and a["task_id"] == task_id for a in report_actions)
+            )
+            latest_md = (reports_dir / "latest_report.md").read_text(encoding="utf-8")
+            self.assertIn("[SHARED PLANE REPORT", latest_md)
+            self.assertIn(task_id, latest_md)
+            self.assertIn("calc.py", latest_md)
+
+            # Next step does not duplicate report
+            self.assertEqual(daemon.step_once(), [])
+
+    def test_daemon_auto_dispatch_sandbox_only_for_disposable_live_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sandbox_repo = tmp_path / ".disposable-live-repo"
+            non_sandbox_repo = tmp_path / "real_prod_repo"
+            _init_git_repo(sandbox_repo)
+            _init_git_repo(non_sandbox_repo)
+
+            # Case 1: .disposable-live-repo on integration auto-dispatches
+            chats1 = tmp_path / "chats1"
+            chats1.mkdir()
+            store1 = TaskStore(db_path=tmp_path / "t1.sqlite")
+            emitter1 = EventEmitter(log_path=tmp_path / "e1.jsonl", enable_notifications=False)
+            eng1 = FakeDaemonEngine()
+            svc1 = TaskService(
+                store=store1,
+                event_emitter=emitter1,
+                engine_factory=lambda: eng1,
+                extra_allowed_repos=[sandbox_repo],
+                dry_run=False,
+            )
+            cfg1 = PlaneConfig(
+                dispatch_mode="auto_dispatch_sandbox",
+                default_repo=str(sandbox_repo),
+                sandbox_repos=[str(sandbox_repo)],
+                reports_dir=str(tmp_path / "r1"),
+            )
+            fake_laya = FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"noul": 0.91},
+                        "action": {"choice": "PROPOSE_BUILD"},
+                        "target_agent": {"choice": "opencode-1"},
+                    }
+                }
+            )
+            daemon1 = SharedPlaneDaemon(
+                config=cfg1,
+                service=svc1,
+                listeners=[GoldfishChatListener(chats_dir=chats1, store=store1)],
+                router=LayaRouter(threshold=0.75, backend=fake_laya),
+                speaker=ReportFileSpeaker(reports_dir=tmp_path / "r1"),
+                dry_run=False,
+            )
+            daemon1.baseline()
+            (chats1 / "c1.json").write_text(
+                json.dumps(
+                    {
+                        "id": "c1",
+                        "messages": [{"id": "m-auto", "role": "user", "content": "Build a calculator"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            res1 = daemon1.step_once()
+            self.assertEqual(res1[0]["status"], "AUTO_DISPATCHED")
+            svc1.wait_all(timeout_sec=5.0)
+            self.assertEqual(len(eng1.invoked_agents), 1)
+            res1_done = daemon1.step_once()
+            self.assertTrue(any(a["action"] == "REPORT_SPOKEN" for a in res1_done))
+
+            # Case 2: Non-sandbox repo refuses auto-dispatch and falls back to PENDING_APPROVAL
+            chats2 = tmp_path / "chats2"
+            chats2.mkdir()
+            store2 = TaskStore(db_path=tmp_path / "t2.sqlite")
+            emitter2 = EventEmitter(log_path=tmp_path / "e2.jsonl", enable_notifications=False)
+            eng2 = FakeDaemonEngine()
+            svc2 = TaskService(
+                store=store2,
+                event_emitter=emitter2,
+                engine_factory=lambda: eng2,
+                extra_allowed_repos=[non_sandbox_repo],
+                dry_run=False,
+            )
+            cfg2 = PlaneConfig(
+                dispatch_mode="auto_dispatch_sandbox",
+                default_repo=str(non_sandbox_repo),
+                sandbox_repos=[str(non_sandbox_repo)],
+                reports_dir=str(tmp_path / "r2"),
+            )
+            daemon2 = SharedPlaneDaemon(
+                config=cfg2,
+                service=svc2,
+                listeners=[GoldfishChatListener(chats_dir=chats2, store=store2)],
+                router=LayaRouter(threshold=0.75, backend=fake_laya),
+                speaker=ReportFileSpeaker(reports_dir=tmp_path / "r2"),
+                dry_run=False,
+            )
+            daemon2.baseline()
+            (chats2 / "c2.json").write_text(
+                json.dumps(
+                    {
+                        "id": "c2",
+                        "messages": [{"id": "m-non-sb", "role": "user", "content": "Build a calculator"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            res2 = daemon2.step_once()
+            self.assertEqual(res2[0]["status"], "PROPOSED")
+            self.assertEqual(len(eng2.invoked_agents), 0)
+
+    def test_daemon_rejects_disallowed_repo_path_and_executes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sandbox_repo = tmp_path / ".disposable-live-repo"
+            _init_git_repo(sandbox_repo)
+            chats_dir = tmp_path / "chats"
+            chats_dir.mkdir()
+            store = TaskStore(db_path=tmp_path / "tasks.sqlite")
+            emitter = EventEmitter(log_path=tmp_path / "events.jsonl", enable_notifications=False)
+            eng = FakeDaemonEngine()
+            svc = TaskService(
+                store=store,
+                event_emitter=emitter,
+                engine_factory=lambda: eng,
+                extra_allowed_repos=[sandbox_repo],
+                dry_run=False,
+            )
+            cfg = PlaneConfig(
+                default_repo=str(sandbox_repo),
+                sandbox_repos=[str(sandbox_repo)],
+                reports_dir=str(tmp_path / "reports"),
+            )
+            fake_laya = FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"noul": 0.95},
+                        "action": {"choice": "PROPOSE_BUILD"},
+                        "target_agent": {"choice": "opencode-1"},
+                    }
+                }
+            )
+            daemon = SharedPlaneDaemon(
+                config=cfg,
+                service=svc,
+                listeners=[GoldfishChatListener(chats_dir=chats_dir, store=store)],
+                router=LayaRouter(threshold=0.75, backend=fake_laya),
+                speaker=ReportFileSpeaker(reports_dir=tmp_path / "reports"),
+                dry_run=False,
+            )
+            daemon.baseline()
+            (chats_dir / "c-bad.json").write_text(
+                json.dumps(
+                    {
+                        "id": "c-bad",
+                        "messages": [
+                            {
+                                "id": "m-bad-1",
+                                "role": "user",
+                                "content": r"Build a tool in C:\Windows\System32",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            actions = daemon.step_once()
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["status"], "REJECTED_POLICY_VIOLATION")
+            self.assertEqual(svc.list_proposals(), [])
+            self.assertEqual(len(eng.invoked_agents), 0)
+
+    def test_doctor_runs_cleanly_without_mutating_goldfish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            gdir = tmp_path / "goldfish_chats"
+            gdir.mkdir()
+            sample = gdir / "chat1.json"
+            sample.write_text('{"id":"chat1","messages":[]}', encoding="utf-8")
+            mtime_before = sample.stat().st_mtime_ns
+            cfg = PlaneConfig(goldfish_chats_dir=str(gdir))
+            with patch("plane.daemon._check_wsl_openrig", return_value=("WARN", "mocked offline")):
+                checks = run_doctor(cfg, store=TaskStore(db_path=tmp_path / "doc.sqlite"))
+            self.assertTrue(len(checks) >= 6)
+            self.assertTrue(all("name" in c and "status" in c and "detail" in c for c in checks))
+            self.assertEqual(sample.stat().st_mtime_ns, mtime_before)
 
 
 if __name__ == "__main__":

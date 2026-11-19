@@ -55,22 +55,30 @@ def _fallback_parse_yaml(text: str) -> Dict[str, Any]:
         parsed = json.loads(stripped)
         return parsed if isinstance(parsed, dict) else {}
 
-    root: Dict[str, Any] = {}
-    stack: List[tuple[int, Any]] = [(-1, root)]
+    clean_lines: List[tuple[int, str]] = []
     for raw_line in text.splitlines():
         line_no_comment = raw_line.split("#", 1)[0].rstrip()
-        if not line_no_comment.strip():
-            continue
-        indent = len(line_no_comment) - len(line_no_comment.lstrip(" "))
-        content = line_no_comment.strip()
-        while len(stack) > 1 and indent <= stack[-1][0]:
-            stack.pop()
-        parent = stack[-1][1]
+        if line_no_comment.strip():
+            indent = len(line_no_comment) - len(line_no_comment.lstrip(" "))
+            clean_lines.append((indent, line_no_comment.strip()))
+
+    root: Dict[str, Any] = {}
+    stack: List[tuple[int, Any]] = [(-1, root)]
+    for idx, (indent, content) in enumerate(clean_lines):
         if content.startswith("- "):
+            while len(stack) > 1 and indent < stack[-1][0]:
+                stack.pop()
+            if len(stack) > 1 and indent == stack[-1][0] and not isinstance(stack[-1][1], list):
+                stack.pop()
+            parent = stack[-1][1]
             item_val = _parse_scalar(content[2:])
             if isinstance(parent, list):
                 parent.append(item_val)
             continue
+
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
         if ":" not in content:
             continue
         key, rest = content.split(":", 1)
@@ -78,9 +86,14 @@ def _fallback_parse_yaml(text: str) -> Dict[str, Any]:
         rest = rest.strip()
         if isinstance(parent, dict):
             if rest == "":
-                # Peek lookahead via next assignment; list vs dict created dynamically
-                parent[key] = {}
-                stack.append((indent, parent[key]))
+                is_list = False
+                if idx + 1 < len(clean_lines):
+                    next_indent, next_content = clean_lines[idx + 1]
+                    if next_content.startswith("- ") and next_indent >= indent:
+                        is_list = True
+                container: Any = [] if is_list else {}
+                parent[key] = container
+                stack.append((indent, container))
             else:
                 parent[key] = _parse_scalar(rest)
     return root
