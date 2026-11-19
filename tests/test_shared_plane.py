@@ -5,12 +5,24 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from unittest.mock import patch
 
+from orchestrator.event_emitter import EventEmitter
+from orchestrator.mcp_server import McpServer
+from orchestrator.models import TaskSpec
+from orchestrator.server import TaskServer
 from orchestrator.store import TaskStore
+from orchestrator.task_service import TaskService
 from plane.adapters.listeners import GoldfishChatListener, JsonlBusListener
+from plane.adapters.speaker import (
+    CompositeSpeaker,
+    ReportFileSpeaker,
+    ToastNotificationSpeaker,
+)
 from plane.config import PlaneConfig
 from plane.router import HeuristicRouter, LayaRouter, create_router
 from plane.schemas import BuildReport, PlaneMessage, RoutingDecision
@@ -470,6 +482,221 @@ class TestPlaneListeners(unittest.TestCase):
             self.assertEqual(msgs[0].conversation_id, "conv-cd")
             self.assertEqual(msgs[0].text, "Build a timer")
             self.assertEqual(listener.poll(), [])
+
+
+class TestPlaneSpeakerAndReadback(unittest.TestCase):
+    def test_report_file_speaker_writes_latest_markdown_and_json_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reports_dir = Path(tmp) / "reports"
+            speaker = ReportFileSpeaker(reports_dir=reports_dir)
+            report = BuildReport(
+                task_id="T-99",
+                status="DONE",
+                repo=tmp,
+                goal="Build calculator",
+                candidate_commit="aaa1111",
+                merge_commit="bbb2222",
+                files_changed=["calc.py"],
+                test_summary="PASS",
+                review_summary="Approved",
+            )
+            res = speaker.speak(report)
+            latest_md_path = reports_dir / "latest_report.md"
+            latest_json_path = reports_dir / "latest_report.json"
+            per_task_path = reports_dir / "T-99.md"
+
+            self.assertTrue(latest_md_path.exists())
+            self.assertTrue(latest_json_path.exists())
+            self.assertTrue(per_task_path.exists())
+            self.assertEqual(list(reports_dir.glob("*.tmp")), [])
+            self.assertEqual(res["latest_markdown"], str(latest_md_path))
+
+            latest_md = latest_md_path.read_text(encoding="utf-8")
+            self.assertIn("[SHARED PLANE REPORT", latest_md)
+            self.assertIn("T-99", latest_md)
+            self.assertIn("calc.py", latest_md)
+
+            parsed = json.loads(latest_json_path.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["task_id"], "T-99")
+            self.assertEqual(parsed["merge_commit"], "bbb2222")
+
+    def test_toast_and_composite_speaker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events_file = Path(tmp) / "events.jsonl"
+            reports_dir = Path(tmp) / "reports"
+            emitter = EventEmitter(log_path=events_file, enable_notifications=False)
+            speaker = CompositeSpeaker(
+                [
+                    ReportFileSpeaker(reports_dir=reports_dir),
+                    ToastNotificationSpeaker(emitter=emitter),
+                ]
+            )
+            report = BuildReport(
+                task_id="T-105",
+                status="DONE",
+                repo=tmp,
+                goal="Build toast test",
+                test_summary="1/1 passed",
+            )
+            res = speaker.speak(report)
+            self.assertEqual(len(res["results"]), 2)
+            self.assertTrue((reports_dir / "latest_report.md").exists())
+            log_lines = events_file.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(log_lines), 1)
+            event_obj = json.loads(log_lines[0])
+            self.assertEqual(event_obj["event_type"], "SHARED_PLANE_REPORT")
+            self.assertEqual(event_obj["task_id"], "T-105")
+
+    def test_mcp_get_latest_build_report_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(db_path=Path(tmp) / "tasks.sqlite")
+            emitter = EventEmitter(log_path=Path(tmp) / "events.jsonl", enable_notifications=False)
+            service = TaskService(store=store, event_emitter=emitter, dry_run=True)
+            reports_dir = Path(tmp) / "reports"
+            mcp = McpServer(service=service, reports_dir=reports_dir)
+
+            tools_resp = mcp.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+            tool_names = [t["name"] for t in tools_resp["result"]["tools"]]
+            self.assertIn("get_latest_build_report", tool_names)
+
+            empty_resp = mcp.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "get_latest_build_report", "arguments": {}},
+                }
+            )
+            empty_payload = json.loads(empty_resp["result"]["content"][0]["text"])
+            self.assertFalse(empty_payload["available"])
+
+            speaker = ReportFileSpeaker(reports_dir=reports_dir)
+            speaker.speak(
+                BuildReport(
+                    task_id="T-200",
+                    status="DONE",
+                    repo=tmp,
+                    goal="Expose MCP report",
+                    test_summary="3/3 passed",
+                )
+            )
+            full_resp = mcp.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "get_latest_build_report", "arguments": {}},
+                }
+            )
+            full_payload = json.loads(full_resp["result"]["content"][0]["text"])
+            self.assertTrue(full_payload["available"])
+            self.assertEqual(full_payload["report"]["task_id"], "T-200")
+            self.assertIn("[SHARED PLANE REPORT", full_payload["markdown"])
+
+    def test_http_get_reports_latest_and_inbox_html(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            store = TaskStore(db_path=Path(tmp) / "tasks.sqlite")
+            emitter = EventEmitter(log_path=Path(tmp) / "events.jsonl", enable_notifications=False)
+            service = TaskService(
+                store=store,
+                event_emitter=emitter,
+                extra_allowed_repos=[repo_dir],
+                dry_run=True,
+            )
+            reports_dir = Path(tmp) / "reports"
+            server = TaskServer(
+                service=service,
+                host="127.0.0.1",
+                port=0,
+                token_path=Path(tmp) / "auth.token",
+                reports_dir=reports_dir,
+            )
+            server.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.port}"
+                # Requires Bearer auth
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"{base_url}/reports/latest")
+                self.assertEqual(ctx.exception.code, 401)
+
+                # Before any report
+                req = urllib.request.Request(f"{base_url}/reports/latest")
+                req.add_header("Authorization", f"Bearer {server.auth_token}")
+                with urllib.request.urlopen(req) as resp:
+                    empty_data = json.loads(resp.read().decode("utf-8"))
+                self.assertFalse(empty_data["available"])
+
+                # After ReportFileSpeaker writes report
+                ReportFileSpeaker(reports_dir=reports_dir).speak(
+                    BuildReport(
+                        task_id="T-300",
+                        status="DONE",
+                        repo=str(repo_dir),
+                        goal="HTTP report check",
+                    )
+                )
+                req2 = urllib.request.Request(f"{base_url}/reports/latest")
+                req2.add_header("Authorization", f"Bearer {server.auth_token}")
+                with urllib.request.urlopen(req2) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(data["available"])
+                self.assertEqual(data["report"]["task_id"], "T-300")
+                self.assertIn("[SHARED PLANE REPORT", data["markdown"])
+
+                # /inbox HTML contains Latest Build Report section
+                with urllib.request.urlopen(f"{base_url}/inbox") as resp:
+                    html = resp.read().decode("utf-8")
+                self.assertIn("latest-report-box", html)
+                self.assertIn("/reports/latest", html)
+            finally:
+                server.stop()
+
+    def test_http_approve_proposal_preserves_codex_assigned_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            store = TaskStore(db_path=Path(tmp) / "tasks.sqlite")
+            emitter = EventEmitter(log_path=Path(tmp) / "events.jsonl", enable_notifications=False)
+            service = TaskService(
+                store=store,
+                event_emitter=emitter,
+                extra_allowed_repos=[repo_dir],
+                dry_run=True,
+            )
+            server = TaskServer(
+                service=service,
+                host="127.0.0.1",
+                port=0,
+                token_path=Path(tmp) / "auth.token",
+            )
+            server.start()
+            try:
+                spec = TaskSpec(
+                    repo=str(repo_dir),
+                    goal="Codex task via inbox",
+                    verification_commands=["python -m unittest"],
+                    assigned_agents={
+                        "planner": "antigravity-1",
+                        "implementer": "codex-1",
+                        "reviewer": "opencode-1",
+                    },
+                )
+                prop = service.propose_task(spec=spec, source="shared_plane:goldfish")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{server.port}/proposals/{prop['proposal_id']}/approve",
+                    data=b"{}",
+                    method="POST",
+                )
+                req.add_header("Authorization", f"Bearer {server.auth_token}")
+                req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req) as resp:
+                    approved = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(approved["status"], "DRY_RUN")
+                self.assertEqual(approved["spec_id"], spec.compute_hash())
+            finally:
+                server.stop()
 
 
 if __name__ == "__main__":

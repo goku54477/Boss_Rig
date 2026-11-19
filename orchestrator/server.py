@@ -20,6 +20,7 @@ from orchestrator.task_service import (
     TaskNotFoundError,
     TaskService,
 )
+from plane.adapters.speaker import read_latest_report
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TOKEN_FILE = REPO_ROOT / ".openrig-bridge" / "auth.token"
@@ -53,6 +54,7 @@ class TaskServiceHandler(BaseHTTPRequestHandler):
 
     service: TaskService
     auth_token: str
+    reports_dir: Path
 
     def _send_json(self, status_code: int, data: Dict[str, Any]) -> None:
         payload = json.dumps(data).encode("utf-8")
@@ -141,6 +143,9 @@ class TaskServiceHandler(BaseHTTPRequestHandler):
                 q_status = query.get("status", ["PENDING"])[0]
                 questions = self.service.task_questions(task_id=task_id, status=q_status)
                 self._send_json(200, {"questions": questions})
+            elif path == "/reports/latest":
+                latest = read_latest_report(self.reports_dir)
+                self._send_json(200, latest)
             else:
                 self._send_json(404, {"error": "NotFound", "path": path})
         except TaskNotFoundError as exc:
@@ -211,6 +216,11 @@ class TaskServiceHandler(BaseHTTPRequestHandler):
                     allowed_merge_target=raw_spec.get("allowed_merge_target", "integration"),
                     timeout_sec=int(raw_spec.get("timeout_sec", 1800)),
                     spec_version=int(raw_spec.get("spec_version", 1)),
+                    assigned_agents=raw_spec.get("assigned_agents") or {
+                        "planner": "antigravity-1",
+                        "implementer": "opencode-1",
+                        "reviewer": "antigravity-1",
+                    },
                 )
                 res = self.service.propose_task(
                     spec=spec,
@@ -236,6 +246,11 @@ class TaskServiceHandler(BaseHTTPRequestHandler):
                     allowed_merge_target=spec_dict.get("allowed_merge_target", "integration"),
                     timeout_sec=int(spec_dict.get("timeout_sec", 1800)),
                     spec_version=int(spec_dict.get("spec_version", 1)),
+                    assigned_agents=spec_dict.get("assigned_agents") or {
+                        "planner": "antigravity-1",
+                        "implementer": "opencode-1",
+                        "reviewer": "antigravity-1",
+                    },
                 )
                 # Create cryptographic approval token and nonce
                 from orchestrator.security import create_approval_token
@@ -245,7 +260,7 @@ class TaskServiceHandler(BaseHTTPRequestHandler):
                     repo=prop["repo"],
                     conversation_id=prop.get("conversation_id") or "inbox",
                     message_id=prop.get("message_id") or proposal_id,
-                    secret_key=self.auth_token,
+                    secret_key=get_or_create_auth_token(),
                     nonce=nonce,
                     allowed_actions=["execute_local"],
                 )
@@ -379,6 +394,11 @@ class TaskServiceHandler(BaseHTTPRequestHandler):
       <h2>Task Timeline & Evidence</h2>
       <div id="timeline-box"><div style="color: var(--muted)">Select a task to inspect sequenced outbox events and verification evidence.</div></div>
     </div>
+
+    <div class="card">
+      <h2>Latest Shared Plane Report</h2>
+      <div id="latest-report-box"><div style="color: var(--muted)">Loading latest build report...</div></div>
+    </div>
   </div>
 </div>
 
@@ -412,9 +432,26 @@ async function refreshAll() {
       const tData = await tRes.json();
       renderTasks(tData.tasks || []);
     }
+
+    const rRes = await fetch("/reports/latest", { headers: authHeaders() });
+    if (rRes.ok) {
+      const rData = await rRes.json();
+      renderLatestReport(rData);
+    }
   } catch (err) {
     console.error("Refresh failed", err);
   }
+}
+
+function renderLatestReport(data) {
+  const box = document.getElementById("latest-report-box");
+  if (!box) return;
+  if (!data || !data.available) {
+    box.innerHTML = "<div style='color: var(--muted)'>No Shared Plane build report recorded yet.</div>";
+    return;
+  }
+  const md = data.markdown || JSON.stringify(data.report || {}, null, 2);
+  box.innerHTML = `<pre>${escapeHtml(md)}</pre>`;
 }
 
 function renderProposals(proposals) {
@@ -546,16 +583,26 @@ class TaskServer:
         host: str = "127.0.0.1",
         port: int = 8383,
         token_path: Optional[Path] = None,
+        reports_dir: Optional[Path] = None,
     ):
         self.service = service
         self.host = host
         self.port = port
         self.auth_token = get_or_create_auth_token(token_path)
+        self.reports_dir = (
+            Path(reports_dir)
+            if reports_dir is not None
+            else (self.service.store.db_path.parent / "reports")
+        )
 
         handler_class = type(
             "ConfiguredHandler",
             (TaskServiceHandler,),
-            {"service": self.service, "auth_token": self.auth_token},
+            {
+                "service": self.service,
+                "auth_token": self.auth_token,
+                "reports_dir": self.reports_dir,
+            },
         )
         self.httpd = HTTPServer((self.host, self.port), handler_class)
         self.port = self.httpd.server_port

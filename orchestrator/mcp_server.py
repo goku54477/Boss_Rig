@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from orchestrator.models import TaskSpec
 from orchestrator.task_service import TaskService
+from plane.adapters.speaker import read_latest_report
 
 MCP_TOOLS = [
     {
@@ -160,6 +162,14 @@ MCP_TOOLS = [
             "required": ["question_id", "answer"],
         },
     },
+    {
+        "name": "get_latest_build_report",
+        "description": "Retrieve the latest Shared Plane [SHARED PLANE REPORT] build summary and markdown.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 
@@ -167,8 +177,17 @@ MCP_TOOLS = [
 class McpServer:
     """JSON-RPC 2.0 Stdio Server exposing Boss Rig Task Service via MCP protocol."""
 
-    def __init__(self, service: Optional[TaskService] = None):
+    def __init__(
+        self,
+        service: Optional[TaskService] = None,
+        reports_dir: Optional[Path] = None,
+    ):
         self.service = service or TaskService()
+        self.reports_dir = (
+            Path(reports_dir)
+            if reports_dir is not None
+            else (self.service.store.db_path.parent / "reports")
+        )
 
     def handle_request(self, req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         msg_id = req.get("id")
@@ -280,6 +299,10 @@ class McpServer:
                     task_id=args.get("task_id"),
                     conversation_id=args.get("conversation_id"),
                 )
+                content = json.dumps(res, indent=2)
+
+            elif name == "get_latest_build_report":
+                res = read_latest_report(self.reports_dir)
                 content = json.dumps(res, indent=2)
 
             else:
