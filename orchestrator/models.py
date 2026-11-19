@@ -21,6 +21,7 @@ class TaskState(str, enum.Enum):
     MERGE_READY = "MERGE_READY"
     MERGING = "MERGING"
     DONE = "DONE"
+    FAILED = "FAILED"
     BLOCKED = "BLOCKED"
     CANCELLED = "CANCELLED"
 

@@ -2,28 +2,39 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from orchestrator.dispatcher import SeatHoldError, TaskDispatcher
 from orchestrator.goldfish import GoldfishPrimer
 from orchestrator.models import SeatMode, TaskEnvelope, TaskRecord, TaskState
 from orchestrator.policy import PolicyEngine, PolicyViolation
+from orchestrator.security import to_wsl_path
 from orchestrator.store import TaskStore
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GATE_SCRIPT = REPO_ROOT / "scripts" / "worktree-gate.sh"
 WORKTREES_DIR = REPO_ROOT / ".worktrees"
+_WIN_PATH_ARG_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 def run_gate(*args: str, repo: Optional[Path] = None) -> subprocess.CompletedProcess[str]:
     target = repo or REPO_ROOT
-    cmd = ["bash", str(GATE_SCRIPT), *args]
+    script_arg = to_wsl_path(GATE_SCRIPT) if sys.platform == "win32" else str(GATE_SCRIPT)
+    converted_args = [
+        to_wsl_path(a) if (sys.platform == "win32" and _WIN_PATH_ARG_RE.match(a)) else a
+        for a in args
+    ]
+    cmd = ["bash", script_arg, *converted_args]
     return subprocess.run(
         cmd,
         cwd=str(target),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 
@@ -130,10 +141,20 @@ class OrchestrationEngine:
                 f"Seat '{engine}' is on MANUAL_HOLD: {reason}. Automated turn rejected."
             )
 
-        # Ensure seat worktree is initialized
+        # Ensure seat worktree is a valid Git worktree; fail fast instead of leaving an empty dir
         seat_wt = self.worktrees_dir / engine
         if not seat_wt.exists():
-            self.run_gate("init-seat", engine)
+            init_res = self.run_gate("init-seat", engine)
+            if init_res.returncode != 0 or not (seat_wt / ".git").exists():
+                raise RuntimeError(
+                    f"worktree-gate init-seat failed for '{engine}' (rc={init_res.returncode}): "
+                    f"stdout={init_res.stdout.strip()} stderr={init_res.stderr.strip()}"
+                )
+        elif not (seat_wt / ".git").exists():
+            raise RuntimeError(
+                f"Seat worktree '{seat_wt}' exists without a valid .git worktree marker; "
+                f"remove the empty directory and re-run init-seat."
+            )
 
         # Bind seat to task branch for implementer role requiring writable branch mutations
         if role == "implementer":
@@ -180,9 +201,10 @@ class OrchestrationEngine:
                 candidate_commit=task.candidate_commit,
             )
         else:
+            fail_state = TaskState.REVIEW_FAILED if role == "reviewer" else TaskState.FAILED
             task.transition(
-                TaskState.REVIEW_FAILED,
-                reason=f"Agent turn failed with status {status}",
+                fail_state,
+                reason=f"Agent turn failed at role '{role}' with status {status}",
                 error=event.get("error", "Execution failure"),
             )
 

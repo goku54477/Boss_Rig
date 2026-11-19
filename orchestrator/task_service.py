@@ -251,7 +251,7 @@ class TaskService:
         """Fetch terminal execution result, commits, and verification evidence."""
         task = self.task_status(task_id)
         state = task.get("state")
-        is_finished = state in ("DONE", "REVIEW_FAILED", "CANCELLED", "BLOCKED")
+        is_finished = state in ("DONE", "REVIEW_FAILED", "FAILED", "CANCELLED", "BLOCKED")
 
         # Query core task record from tasks table for commits if available
         rec = self.store.get_task(task_id)
@@ -262,6 +262,7 @@ class TaskService:
         outbox_events = self.store.get_task_outbox_events(task_id, limit=200)
         review_findings = None
         test_evidence = None
+        failed_stage = None
         for ev in reversed(outbox_events):
             if not review_findings and ev.get("review_findings"):
                 review_findings = ev.get("review_findings")
@@ -271,6 +272,8 @@ class TaskService:
                 candidate_commit = ev.get("candidate_commit")
             if not merge_commit and ev.get("merge_commit"):
                 merge_commit = ev.get("merge_commit")
+            if not failed_stage and isinstance(ev.get("data"), dict):
+                failed_stage = ev["data"].get("failed_stage")
 
         spec = task.get("spec", {})
         return {
@@ -278,6 +281,7 @@ class TaskService:
             "state": state,
             "finished": is_finished,
             "error": task.get("error"),
+            "failed_stage": failed_stage,
             "repo": task.get("repo"),
             "allowed_merge_target": task.get("allowed_merge_target"),
             "spec_id": task.get("spec_id"),
@@ -514,8 +518,45 @@ class TaskService:
         )
         raise BridgeError(f"Question {qid} timed out after {timeout_sec}s awaiting user answer.")
 
+    def _record_stage_failure(
+        self,
+        task_id: str,
+        spec_hash: str,
+        stage: str,
+        fail_state: str,
+        event_type: str,
+        summary: str,
+        error_msg: str,
+        role: Optional[str] = None,
+        seat_id: Optional[str] = None,
+        candidate_commit: Optional[str] = None,
+        review_findings: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist failure state, outbox event with failed_stage, and OS notification."""
+        self.store.update_bridge_task_state(task_id, fail_state, error=error_msg)
+        self.store.emit_outbox_event(
+            task_id=task_id,
+            event_type=event_type,
+            lifecycle_status=fail_state,
+            role=role,
+            seat_id=seat_id,
+            summary=summary,
+            candidate_commit=candidate_commit,
+            review_findings=review_findings,
+            data={"state": fail_state, "failed_stage": stage, "error": error_msg},
+        )
+        self.emitter.emit(
+            "TASK_FAILED",
+            task_id=task_id,
+            spec_id=spec_hash,
+            data={"state": fail_state, "failed_stage": stage, "error": error_msg},
+            notification_title=f"[Boss Rig] Task {fail_state} ({stage})",
+            notification_body=f"Task {task_id} failed at {stage}: {error_msg[:60]}",
+        )
+
     def _run_task_worker(self, task_id: str, spec: TaskSpec, spec_hash: str) -> None:
         """Background thread executing the task through the orchestration pipeline."""
+        stage = "dispatch"
         try:
             self.store.update_bridge_task_state(task_id, TaskState.ACTIVE.value)
             self.store.emit_outbox_event(
@@ -535,6 +576,7 @@ class TaskService:
 
             # Execute via engine if available
             if hasattr(engine, "execute_bridge_task"):
+                stage = "bridge_execute"
                 result = engine.execute_bridge_task(
                     task_id=task_id,
                     spec=spec,
@@ -568,6 +610,7 @@ class TaskService:
                     )
             else:
                 # Fallback standard OrchestrationEngine flow
+                stage = "dispatch"
                 record = engine.create_task(
                     task_id=task_id,
                     goal=spec.goal,
@@ -584,6 +627,7 @@ class TaskService:
                     raise PolicyViolation("Reviewer cannot be implementer.")
 
                 # Turn 1: Planning
+                stage = "planner"
                 self.store.emit_outbox_event(
                     task_id=task_id,
                     event_type="planner.started",
@@ -595,15 +639,17 @@ class TaskService:
                 engine.assign_role(task_id, engine=planner, role="planner")
                 p_res = engine.execute_turn(task_id, engine=planner, role="planner", prompt=spec.goal)
                 if p_res.get("status") != "SUCCESS":
-                    self.store.update_bridge_task_state(task_id, TaskState.REVIEW_FAILED.value, error="Planning failed")
-                    self.store.emit_outbox_event(
+                    err_msg = str(p_res.get("error") or "Planning failed")
+                    self._record_stage_failure(
                         task_id=task_id,
+                        spec_hash=spec_hash,
+                        stage="planner",
+                        fail_state=TaskState.FAILED.value,
                         event_type="planner.failed",
-                        lifecycle_status="REVIEW_FAILED",
+                        summary=f"Planning turn failed on {planner}: {err_msg}",
+                        error_msg=err_msg,
                         role="planner",
                         seat_id=planner,
-                        summary="Planning turn failed",
-                        data={"error": p_res.get("error", "Planning failed")},
                     )
                     return
                 self.store.emit_outbox_event(
@@ -616,6 +662,7 @@ class TaskService:
                 )
 
                 # Turn 2: Implementing
+                stage = "implementer"
                 self.store.emit_outbox_event(
                     task_id=task_id,
                     event_type="implementation.started",
@@ -627,15 +674,17 @@ class TaskService:
                 engine.assign_role(task_id, engine=implementer, role="implementer")
                 i_res = engine.execute_turn(task_id, engine=implementer, role="implementer", prompt=spec.goal)
                 if i_res.get("status") != "SUCCESS":
-                    self.store.update_bridge_task_state(task_id, TaskState.REVIEW_FAILED.value, error="Implementation failed")
-                    self.store.emit_outbox_event(
+                    err_msg = str(i_res.get("error") or "Implementation failed")
+                    self._record_stage_failure(
                         task_id=task_id,
+                        spec_hash=spec_hash,
+                        stage="implementer",
+                        fail_state=TaskState.FAILED.value,
                         event_type="implementation.failed",
-                        lifecycle_status="REVIEW_FAILED",
+                        summary=f"Implementation turn failed on {implementer}: {err_msg}",
+                        error_msg=err_msg,
                         role="implementer",
                         seat_id=implementer,
-                        summary="Implementation turn failed",
-                        data={"error": i_res.get("error", "Implementation failed")},
                     )
                     return
 
@@ -652,6 +701,7 @@ class TaskService:
                 )
 
                 # Turn 3: Review
+                stage = "reviewer"
                 self.store.emit_outbox_event(
                     task_id=task_id,
                     event_type="review.started",
@@ -664,16 +714,19 @@ class TaskService:
                 engine.assign_role(task_id, engine=reviewer, role="reviewer")
                 r_res = engine.execute_turn(task_id, engine=reviewer, role="reviewer", prompt=spec.goal)
                 if r_res.get("status") != "SUCCESS":
-                    self.store.update_bridge_task_state(task_id, TaskState.REVIEW_FAILED.value, error="Review failed")
-                    self.store.emit_outbox_event(
+                    err_msg = str(r_res.get("error") or "Review rejected")
+                    self._record_stage_failure(
                         task_id=task_id,
+                        spec_hash=spec_hash,
+                        stage="reviewer",
+                        fail_state=TaskState.REVIEW_FAILED.value,
                         event_type="review.failed",
-                        lifecycle_status="REVIEW_FAILED",
+                        summary="Review turn rejected candidate commit",
+                        error_msg=err_msg,
                         role="reviewer",
                         seat_id=reviewer,
-                        summary="Review turn rejected candidate commit",
                         candidate_commit=cand_commit,
-                        review_findings={"verdict": "FAIL", "error": r_res.get("error", "Review rejected")},
+                        review_findings={"verdict": "FAIL", "error": err_msg},
                     )
                     return
                 self.store.emit_outbox_event(
@@ -688,6 +741,7 @@ class TaskService:
                 )
 
                 # Verification gate
+                stage = "merge_gate"
                 self.store.emit_outbox_event(
                     task_id=task_id,
                     event_type="verification.started",
@@ -717,6 +771,7 @@ class TaskService:
                         lifecycle_status="REVIEW_FAILED",
                         summary="Deterministic verification gate failed",
                         candidate_commit=cand_commit,
+                        data={"failed_stage": "merge_gate"},
                         test_evidence={"exit_code": 1, "status": "FAILED"},
                     )
 
@@ -724,6 +779,9 @@ class TaskService:
                 return
 
             self.store.update_bridge_task_state(task_id, state, error=error)
+            extra_data: Dict[str, Any] = {"state": state, "error": error}
+            if state != TaskState.DONE.value:
+                extra_data["failed_stage"] = stage
             self.store.emit_outbox_event(
                 task_id=task_id,
                 event_type="task.done" if state == TaskState.DONE.value else "task.failed",
@@ -731,29 +789,33 @@ class TaskService:
                 summary=f"Task {task_id} completed with status {state}",
                 candidate_commit=cand_commit,
                 merge_commit=mrg_commit,
-                data={"state": state, "error": error},
+                data=extra_data,
             )
             self.emitter.emit(
                 "TASK_COMPLETED" if state == TaskState.DONE.value else "TASK_FAILED",
                 task_id=task_id,
                 spec_id=spec_hash,
-                data={"state": state, "error": error},
+                data=extra_data,
                 notification_title=f"[Boss Rig] Task {state}",
                 notification_body=f"Task {task_id} finished with state {state}.",
             )
 
-
         except Exception as exc:
             if self._cancellation_flags.get(task_id):
                 return
-            self.store.update_bridge_task_state(task_id, TaskState.REVIEW_FAILED.value, error=str(exc))
-            self.emitter.emit(
-                "TASK_FAILED",
+            fail_state = (
+                TaskState.REVIEW_FAILED.value
+                if stage == "bridge_execute"
+                else TaskState.FAILED.value
+            )
+            self._record_stage_failure(
                 task_id=task_id,
-                spec_id=spec_hash,
-                data={"error": str(exc)},
-                notification_title="[Boss Rig] Task Error",
-                notification_body=f"Task {task_id} error: {str(exc)[:60]}",
+                spec_hash=spec_hash,
+                stage=stage,
+                fail_state=fail_state,
+                event_type="task.failed",
+                summary=f"Task {task_id} failed at stage '{stage}': {exc}",
+                error_msg=str(exc),
             )
         finally:
             with self._lock:

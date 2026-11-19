@@ -53,6 +53,7 @@ class BuildReport:
     files_changed: List[str] = field(default_factory=list)
     test_summary: str = ""
     review_summary: str = ""
+    failed_stage: Optional[str] = None
     created_at: float = field(default_factory=time.time)
 
     def to_markdown(self) -> str:
@@ -67,17 +68,23 @@ class BuildReport:
             "",
             f"- **Task ID:** `{self.task_id}`",
             f"- **Status:** `{self.status}`",
-            f"- **Repo:** `{self.repo}`",
-            f"- **Goal:** {self.goal}",
-            f"- **Candidate Commit:** `{self.candidate_commit or 'none'}`",
-            f"- **Merge Commit:** `{self.merge_commit or 'none'}`",
-            f"- **Tests:** {self.test_summary or 'n/a'}",
-            f"- **Review:** {self.review_summary or 'n/a'}",
-            "",
-            "### Files Changed",
-            files_block,
-            "",
         ]
+        if self.failed_stage:
+            lines.append(f"- **Failed Stage:** `{self.failed_stage}`")
+        lines.extend(
+            [
+                f"- **Repo:** `{self.repo}`",
+                f"- **Goal:** {self.goal}",
+                f"- **Candidate Commit:** `{self.candidate_commit or 'none'}`",
+                f"- **Merge Commit:** `{self.merge_commit or 'none'}`",
+                f"- **Tests:** {self.test_summary or 'n/a'}",
+                f"- **Review:** {self.review_summary or 'n/a'}",
+                "",
+                "### Files Changed",
+                files_block,
+                "",
+            ]
+        )
         return "\n".join(lines)
 
     def to_dict(self) -> Dict[str, Any]:

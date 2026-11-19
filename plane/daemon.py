@@ -32,7 +32,7 @@ from plane.config import PlaneConfig, resolve_repo_path
 from plane.router import BaseRouter, create_router
 from plane.schemas import BuildReport, PlaneMessage, RoutingDecision
 
-TERMINAL_STATES = ("DONE", "REVIEW_FAILED", "CANCELLED", "BLOCKED")
+TERMINAL_STATES = ("DONE", "REVIEW_FAILED", "FAILED", "CANCELLED", "BLOCKED")
 
 _EXPLICIT_REPO_KV_RE = re.compile(r"\brepo=[\"']?([^\"'\r\n]+?)[\"']?(?:\s|$)", re.IGNORECASE)
 _WIN_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z]:[\\/][^\s\"'`]+)")
@@ -383,8 +383,11 @@ class SharedPlaneDaemon:
                 candidate_commit=res.get("candidate_commit"),
                 merge_commit=res.get("merge_commit"),
                 files_changed=files_changed,
-                test_summary=_format_evidence_summary(res.get("test_evidence"), state),
+                test_summary=_format_evidence_summary(
+                    res.get("test_evidence"), res.get("error") or state
+                ),
                 review_summary=_format_evidence_summary(res.get("review_findings"), "n/a"),
+                failed_stage=res.get("failed_stage"),
             )
             speak_res = self.speaker.speak(report)
             emitted.append(

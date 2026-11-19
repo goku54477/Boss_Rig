@@ -97,7 +97,8 @@ class ToastNotificationSpeaker(BaseSpeaker):
         self.emitter = emitter
 
     def speak(self, report: BuildReport) -> Dict[str, Any]:
-        title = f"[Shared Plane] {report.task_id} — {report.status}"
+        stage_suffix = f" ({report.failed_stage})" if report.failed_stage else ""
+        title = f"[Shared Plane] {report.task_id} — {report.status}{stage_suffix}"
         summary_part = report.test_summary or report.status
         body = f"{report.goal[:80]} ({summary_part})"
         event = self.emitter.emit(

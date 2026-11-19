@@ -48,6 +48,25 @@ def normalize_repo_path(path: Path | str) -> Path:
     return p
 
 
+_WIN_DRIVE_RE = re.compile(r"^([A-Za-z]):(?:[\\/](.*))?$")
+
+
+def to_wsl_path(path: Path | str, platform: Optional[str] = None) -> str:
+    """Convert a Windows drive path (e.g. C:\\Users\\...) to a WSL /mnt/<drive>/... path."""
+    raw = str(path)
+    target_platform = platform if platform is not None else sys.platform
+    if target_platform != "win32":
+        return raw
+    if raw.startswith("/"):
+        return raw
+    match = _WIN_DRIVE_RE.match(raw)
+    if not match:
+        return raw.replace("\\", "/")
+    drive = match.group(1).lower()
+    rest = (match.group(2) or "").replace("\\", "/").lstrip("/")
+    return f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
+
+
 def create_approval_token(
     spec_id: str,
     repo: str,

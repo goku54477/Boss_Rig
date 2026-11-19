@@ -501,12 +501,13 @@ function renderTasks(tasks) {
     return;
   }
   container.innerHTML = tasks.map(t => `
-    <div class="item ${t.state === 'DONE' ? 'done' : t.state === 'REVIEW_FAILED' ? 'error' : ''}">
+    <div class="item ${t.state === 'DONE' ? 'done' : (t.state === 'REVIEW_FAILED' || t.state === 'FAILED') ? 'error' : ''}">
       <div style="display:flex; justify-content:space-between;">
         <strong>${escapeHtml(t.task_id)}</strong>
         <span class="badge">${escapeHtml(t.state)}</span>
       </div>
       <div style="margin: 6px 0; font-size: 13px;">${escapeHtml(t.goal)}</div>
+      ${t.error ? `<div style="margin: 4px 0; font-size: 12px; color: #fca5a5;">${escapeHtml(t.error)}</div>` : ''}
       <div class="actions">
         <button class="btn" onclick="inspectTask('${t.task_id}')">Inspect Timeline & Evidence</button>
         ${t.state === 'ACTIVE' || t.state === 'QUEUED' ? `<button class="btn btn-danger" onclick="cancelTask('${t.task_id}')">Cancel</button>` : ''}
@@ -552,6 +553,8 @@ async function inspectTask(taskId) {
     box.innerHTML = `
       <h3>Task: ${escapeHtml(taskId)}</h3>
       <div><strong>Status:</strong> ${escapeHtml(rData.state)}</div>
+      ${rData.failed_stage ? `<div><strong>Failed Stage:</strong> <code>${escapeHtml(rData.failed_stage)}</code></div>` : ''}
+      ${rData.error ? `<div><strong>Error:</strong> <code>${escapeHtml(rData.error)}</code></div>` : ''}
       ${rData.candidate_commit ? `<div><strong>Candidate Commit:</strong> <code>${escapeHtml(rData.candidate_commit)}</code></div>` : ''}
       ${rData.merge_commit ? `<div><strong>Merge Commit:</strong> <code>${escapeHtml(rData.merge_commit)}</code></div>` : ''}
       <h4>Execution Outbox Events (${(eData.events || []).length}):</h4>

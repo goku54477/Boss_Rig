@@ -113,29 +113,38 @@ class PolicyEngine:
     def assert_valid_state_transition(current: TaskState, target: TaskState) -> None:
         """Ensure state transitions adhere to deterministic lifecycle."""
         valid_transitions = {
-            TaskState.QUEUED: [TaskState.ASSIGNED, TaskState.CANCELLED],
-            TaskState.ASSIGNED: [TaskState.ACTIVE, TaskState.CANCELLED],
+            TaskState.QUEUED: [TaskState.ASSIGNED, TaskState.FAILED, TaskState.CANCELLED],
+            TaskState.ASSIGNED: [TaskState.ACTIVE, TaskState.FAILED, TaskState.CANCELLED],
             TaskState.ACTIVE: [
                 TaskState.REVIEW,
                 TaskState.REVIEW_FAILED,
+                TaskState.FAILED,
                 TaskState.WAITING_FOR_USER,
                 TaskState.CANCELLED,
             ],
-            TaskState.WAITING_FOR_USER: [TaskState.ACTIVE, TaskState.CANCELLED],
+            TaskState.WAITING_FOR_USER: [TaskState.ACTIVE, TaskState.FAILED, TaskState.CANCELLED],
             TaskState.REVIEW: [
                 TaskState.MERGE_READY,
                 TaskState.REVIEW_FAILED,
                 TaskState.REVIEW_CONFLICT,
+                TaskState.FAILED,
                 TaskState.CANCELLED,
             ],
-            TaskState.MERGE_READY: [TaskState.MERGING, TaskState.REVIEW_FAILED, TaskState.CANCELLED],
+            TaskState.MERGE_READY: [
+                TaskState.MERGING,
+                TaskState.REVIEW_FAILED,
+                TaskState.FAILED,
+                TaskState.CANCELLED,
+            ],
             TaskState.MERGING: [
                 TaskState.DONE,
                 TaskState.REVIEW_FAILED,
                 TaskState.REVIEW_CONFLICT,
+                TaskState.FAILED,
             ],
             TaskState.REVIEW_FAILED: [TaskState.QUEUED, TaskState.ACTIVE, TaskState.CANCELLED],
             TaskState.REVIEW_CONFLICT: [TaskState.QUEUED, TaskState.ACTIVE, TaskState.CANCELLED],
+            TaskState.FAILED: [TaskState.QUEUED, TaskState.ACTIVE, TaskState.CANCELLED],
             TaskState.BLOCKED: [TaskState.QUEUED, TaskState.CANCELLED],
             TaskState.DONE: [],
             TaskState.CANCELLED: [],
