@@ -237,7 +237,7 @@ class TestConversationalBridgeOfflineAcceptance(unittest.TestCase):
         task_id = submit_res["task_id"]
 
         # Wait for worker
-        time.sleep(0.6)
+        service.wait_all(timeout_sec=5.0)
 
         # Verify task is DONE
         status = service.task_status(task_id)
@@ -457,7 +457,7 @@ class TestConversationalBridgeOfflineAcceptance(unittest.TestCase):
         self.assertEqual(ans_res["status"], "ANSWERED")
 
         # Wait for task to resume and finish
-        time.sleep(0.5)
+        service.wait_all(timeout_sec=5.0)
         st_after = service.task_status(task_id)
         self.assertEqual(st_after["state"], "DONE")
         self.assertEqual(mock_engine.received_answer, "Use JSON please")
@@ -533,7 +533,7 @@ class TestConversationalBridgeOfflineAcceptance(unittest.TestCase):
             approved_hash=spec.compute_hash(),
             approval_record=approval,
         )
-        time.sleep(0.6)
+        service.wait_all(timeout_sec=5.0)
 
         status = service.task_status(res["task_id"])
         self.assertEqual(status["state"], "REVIEW_FAILED")
@@ -566,7 +566,7 @@ class TestConversationalBridgeOfflineAcceptance(unittest.TestCase):
             approved_hash=spec.compute_hash(),
             approval_record=approval,
         )
-        time.sleep(0.6)
+        service.wait_all(timeout_sec=5.0)
 
         status = service.task_status(res["task_id"])
         self.assertEqual(status["state"], "REVIEW_FAILED")
@@ -597,7 +597,7 @@ class TestConversationalBridgeOfflineAcceptance(unittest.TestCase):
             approved_hash=spec.compute_hash(),
             approval_record=approval,
         )
-        time.sleep(0.5)
+        service1.wait_all(timeout_sec=5.0)
         self.assertEqual(service1.task_status(res1["task_id"])["state"], "DONE")
 
         # Simulate restart of Boss Rig service with fresh instance sharing same store
@@ -683,7 +683,7 @@ class TestConversationalBridgeOfflineAcceptance(unittest.TestCase):
             approval_record=approval_b,
         )
 
-        time.sleep(1.0)
+        service.wait_all(timeout_sec=10.0)
 
         # Both should complete cleanly
         st_a = service.task_status(res_a["task_id"])
@@ -727,7 +727,7 @@ class TestConversationalBridgeOfflineAcceptance(unittest.TestCase):
         cancel_res = service.task_cancel(task_id)
         self.assertTrue(cancel_res)
 
-        time.sleep(0.3)
+        service.wait_all(timeout_sec=5.0)
         st = service.task_status(task_id)
         self.assertEqual(st["state"], "CANCELLED")
 

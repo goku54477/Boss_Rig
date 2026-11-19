@@ -224,7 +224,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         task_id = res["task_id"]
 
         # Wait for background worker to complete
-        time.sleep(0.5)
+        service.wait_all(timeout_sec=5.0)
 
         status = service.task_status(task_id)
         self.assertEqual(status["state"], "DONE")
@@ -261,7 +261,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             approved_hash=spec.compute_hash(),
             approval_record=self._create_operator_approval(spec),
         )
-        time.sleep(0.5)
+        service.wait_all(timeout_sec=5.0)
 
         status = service.task_status(res["task_id"])
         self.assertEqual(status["state"], "REVIEW_FAILED")
@@ -290,7 +290,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             approved_hash=spec.compute_hash(),
             approval_record=self._create_operator_approval(spec),
         )
-        time.sleep(0.5)
+        service.wait_all(timeout_sec=5.0)
 
         status = service.task_status(res["task_id"])
         self.assertEqual(status["state"], "REVIEW_FAILED")
@@ -495,7 +495,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         # Second scan must NOT execute it twice
         results_again = watcher.scan_once()
         self.assertEqual(len(results_again), 0)
-        time.sleep(0.4)
+        service.wait_all(timeout_sec=5.0)
         tasks = self.store.list_bridge_tasks()
         self.assertEqual(len(tasks), 1)
 
@@ -557,7 +557,10 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         task_id = res["task_id"]
 
         # Wait for task to pause on question
-        time.sleep(0.3)
+        for _ in range(30):
+            if service.task_questions(task_id=task_id, status="PENDING"):
+                break
+            time.sleep(0.1)
         questions = service.task_questions(task_id=task_id, status="PENDING")
         self.assertEqual(len(questions), 1)
         qid = questions[0]["question_id"]
@@ -568,7 +571,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
         self.assertEqual(ans_res["status"], "ANSWERED")
 
         # Worker resumes and completes
-        time.sleep(0.5)
+        service.wait_all(timeout_sec=5.0)
         status = service.task_status(task_id)
         self.assertEqual(status["state"], "DONE")
         self.assertEqual(mock_engine.received_user_answer, "Port 9090")
@@ -586,7 +589,10 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             approved_hash=spec.compute_hash(),
             approval_record=self._create_operator_approval(spec),
         )
-        time.sleep(0.3)
+        for _ in range(30):
+            if service.task_questions(task_id=res["task_id"], status="PENDING"):
+                break
+            time.sleep(0.1)
 
         questions = service.task_questions(task_id=res["task_id"], status="PENDING")
         self.assertEqual(len(questions), 1)
@@ -600,7 +606,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             service.task_answer(qid, "Mode B")
 
         # Allow worker thread to complete execution before test teardown
-        time.sleep(0.4)
+        service.wait_all(timeout_sec=5.0)
 
     # --- Test 12: Cancellation and timeouts release resources safely ---
     def test_12_cancellation_releases_resources(self) -> None:
@@ -616,12 +622,15 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             approval_record=self._create_operator_approval(spec),
         )
         task_id = res["task_id"]
-        time.sleep(0.3)
+        for _ in range(30):
+            if service.task_questions(task_id=task_id, status="PENDING"):
+                break
+            time.sleep(0.1)
 
         cancelled = service.task_cancel(task_id, reason="User cancelled test")
         self.assertTrue(cancelled)
 
-        time.sleep(0.3)
+        service.wait_all(timeout_sec=5.0)
         status = service.task_status(task_id)
         self.assertEqual(status["state"], "CANCELLED")
 
@@ -644,7 +653,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             approved_hash=spec.compute_hash(),
             approval_record=self._create_operator_approval(spec),
         )
-        time.sleep(0.4)
+        service.wait_all(timeout_sec=5.0)
 
         status = service.task_status(res["task_id"])
         self.assertEqual(status["state"], "REVIEW_FAILED")
@@ -715,7 +724,7 @@ class TestBossRigBridgeE2E(unittest.TestCase):
 
         # Run watcher scan
         watcher.scan_once()
-        time.sleep(0.5)
+        service.wait_all(timeout_sec=5.0)
 
         # Confirm Goldfish files were not written or corrupted
         self.assertEqual(inbox_file.read_text(encoding="utf-8"), inbox_content)
@@ -788,7 +797,13 @@ class TestBossRigBridgeE2E(unittest.TestCase):
     def test_17_real_subprocess_tree_cancellation(self) -> None:
         """17. Verify cancellation actually terminates the process tree and releases resources."""
         import sys
-        service = TaskService(store=self.store, event_emitter=self.emitter, extra_allowed_repos=[self.repo_dir])
+        mock_engine = MockEngine(trigger_question_prompt="Hold worker while testing kill")
+        service = TaskService(
+            store=self.store,
+            event_emitter=self.emitter,
+            engine_factory=lambda: mock_engine,
+            extra_allowed_repos=[self.repo_dir],
+        )
         spec = self._create_sample_spec()
         spec_hash = spec.compute_hash()
 
@@ -801,6 +816,10 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             approval_record=self._create_operator_approval(spec),
         )
         task_id = res["task_id"]
+        for _ in range(30):
+            if service.task_status(task_id)["state"] == "WAITING_FOR_USER":
+                break
+            time.sleep(0.1)
 
         # Launch a harmless local child process simulating an active seat runner
         popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
@@ -831,6 +850,11 @@ class TestBossRigBridgeE2E(unittest.TestCase):
             self.assertTrue(dead, f"Process {pid} should have been terminated by task_cancel")
             self.assertEqual(service.task_status(task_id)["state"], "CANCELLED")
         finally:
+            service.wait_all(timeout_sec=3.0)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
             if is_pid_alive(proc.pid):
                 kill_process_tree(proc.pid)
 
