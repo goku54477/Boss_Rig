@@ -637,7 +637,13 @@ class TaskService:
                     summary=f"Planner turn started by {planner}",
                 )
                 engine.assign_role(task_id, engine=planner, role="planner")
-                p_res = engine.execute_turn(task_id, engine=planner, role="planner", prompt=spec.goal)
+                p_res = engine.execute_turn(
+                    task_id,
+                    engine=planner,
+                    role="planner",
+                    prompt=spec.goal,
+                    timeout_sec=spec.timeout_sec,
+                )
                 if p_res.get("status") != "SUCCESS":
                     err_msg = str(p_res.get("error") or "Planning failed")
                     self._record_stage_failure(
@@ -672,7 +678,13 @@ class TaskService:
                     summary=f"Implementation turn started by {implementer}",
                 )
                 engine.assign_role(task_id, engine=implementer, role="implementer")
-                i_res = engine.execute_turn(task_id, engine=implementer, role="implementer", prompt=spec.goal)
+                i_res = engine.execute_turn(
+                    task_id,
+                    engine=implementer,
+                    role="implementer",
+                    prompt=spec.goal,
+                    timeout_sec=spec.timeout_sec,
+                )
                 if i_res.get("status") != "SUCCESS":
                     err_msg = str(i_res.get("error") or "Implementation failed")
                     self._record_stage_failure(
@@ -712,7 +724,13 @@ class TaskService:
                     candidate_commit=cand_commit,
                 )
                 engine.assign_role(task_id, engine=reviewer, role="reviewer")
-                r_res = engine.execute_turn(task_id, engine=reviewer, role="reviewer", prompt=spec.goal)
+                r_res = engine.execute_turn(
+                    task_id,
+                    engine=reviewer,
+                    role="reviewer",
+                    prompt=spec.goal,
+                    timeout_sec=spec.timeout_sec,
+                )
                 if r_res.get("status") != "SUCCESS":
                     err_msg = str(r_res.get("error") or "Review rejected")
                     self._record_stage_failure(

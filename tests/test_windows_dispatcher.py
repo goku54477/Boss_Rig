@@ -308,6 +308,167 @@ class TestWindowsDispatcherAndStages(unittest.TestCase):
             self.assertEqual(res2["state"], TaskState.REVIEW_FAILED.value)
             self.assertEqual(res2["failed_stage"], "reviewer")
 
+    def test_task_service_forwards_spec_timeout_sec_to_all_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo_dir = tmp_path / ".disposable-live-repo"
+            _init_temp_git_repo(repo_dir)
+            store = TaskStore(db_path=tmp_path / "tasks.sqlite")
+            emitter = EventEmitter(log_path=tmp_path / "events.jsonl", enable_notifications=False)
+            service = TaskService(
+                store=store,
+                event_emitter=emitter,
+                extra_allowed_repos=[repo_dir],
+                dry_run=False,
+            )
+            spec = TaskSpec(
+                repo=str(repo_dir),
+                goal="Build Pomodoro app",
+                verification_commands=[],
+                timeout_sec=1800,
+                assigned_agents={
+                    "planner": "antigravity-1",
+                    "implementer": "codex-1",
+                    "reviewer": "opencode-1",
+                },
+            )
+            spec_hash = spec.compute_hash()
+            tok = create_approval_token(
+                spec_id=spec_hash,
+                repo=str(repo_dir),
+                conversation_id="c1",
+                message_id="m-to",
+                secret_key=get_or_create_auth_token(),
+                nonce="n-to",
+            )
+            seen_timeouts = []
+
+            def fake_turn(self_eng, task_id, engine, role, prompt=None, timeout_sec=60, **kwargs):
+                seen_timeouts.append((role, timeout_sec))
+                return {"status": "SUCCESS"}
+
+            with patch.object(OrchestrationEngine, "execute_turn", fake_turn), patch.object(
+                OrchestrationEngine, "run_deterministic_verification", return_value=True
+            ):
+                service.task_submit(
+                    spec=spec,
+                    idempotency_key="timeout-forward-1",
+                    approved=True,
+                    approved_hash=spec_hash,
+                    approval_record={
+                        "spec_id": spec_hash,
+                        "repo": str(repo_dir),
+                        "source": "local_web",
+                        "conversation_id": "c1",
+                        "message_id": "m-to",
+                        "approval_token": tok,
+                        "nonce": "n-to",
+                    },
+                )
+                service.wait_all(timeout_sec=5.0)
+
+            self.assertEqual(
+                seen_timeouts,
+                [("planner", 1800), ("implementer", 1800), ("reviewer", 1800)],
+            )
+
+    def test_dispatcher_timeout_closes_and_evicts_seat_bridge(self) -> None:
+        script = (
+            "import sys, json, time\n"
+            "line = sys.stdin.readline().strip()\n"
+            "req = json.loads(line)\n"
+            "print('BRIDGE_EVENT ' + json.dumps({'event': 'task_started', 'task_id': req['task_id'], 'status': 'RUNNING'}), flush=True)\n"
+            "time.sleep(10)\n"
+        )
+        from orchestrator.models import TaskEnvelope
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt_root = Path(tmp) / ".worktrees"
+            seat_wt = wt_root / "codex-1"
+            seat_wt.mkdir(parents=True)
+            (seat_wt / ".git").write_text("gitdir: /tmp/fake\n", encoding="utf-8")
+
+            dispatcher = TaskDispatcher(worktrees_dir=wt_root)
+            bridge = SeatBridgeProcess(
+                seat_id="codex-1",
+                script_name="codex-seat-runner.sh",
+                cwd=seat_wt,
+                command=[sys.executable, "-c", script],
+            )
+            dispatcher.active_bridges["codex-1"] = bridge
+            try:
+                env = TaskEnvelope(
+                    task_id="T-TIMEOUT-EVICT",
+                    role="implementer",
+                    goal="Hang past timeout",
+                    timeout_sec=1,
+                )
+                res = dispatcher.dispatch_task("codex-1", env, timeout_sec=0.3)
+                self.assertEqual(res["status"], "TIMEOUT")
+                self.assertNotIn("codex-1", dispatcher.active_bridges)
+                self.assertFalse(bridge.is_alive())
+            finally:
+                dispatcher.close_all()
+
+    def test_implementer_turn_auto_commits_and_excludes_seat_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo_dir = tmp_path / ".disposable-live-repo"
+            _init_temp_git_repo(repo_dir)
+            base_head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
+            ).strip()
+
+            seat_wt = repo_dir / ".worktrees" / "codex-1"
+            subprocess.run(
+                ["git", "worktree", "add", "-b", "task/T-AUTOCOMMIT", str(seat_wt), "integration"],
+                cwd=repo_dir,
+                check=True,
+                capture_output=True,
+            )
+
+            store = TaskStore(db_path=tmp_path / "tasks.sqlite")
+            engine = OrchestrationEngine(target_repo=repo_dir, store=store)
+            engine.create_task("T-AUTOCOMMIT", "Build Pomodoro app", verification_commands=[])
+            engine.assign_role("T-AUTOCOMMIT", "codex-1", "implementer")
+
+            def fake_dispatch(eng, envelope, timeout_sec=60, on_activity=None):
+                (seat_wt / "index.html").write_text("<h1>Pomodoro</h1>\n", encoding="utf-8")
+                (seat_wt / "style.css").write_text("body { margin: 0; }\n", encoding="utf-8")
+                (seat_wt / "script.js").write_text("console.log('ready');\n", encoding="utf-8")
+                (seat_wt / ".openrig-codex-seat.log").write_text("internal log\n", encoding="utf-8")
+                return {"status": "SUCCESS", "exit_code": 0}
+
+            with patch.object(
+                engine,
+                "run_gate",
+                return_value=subprocess.CompletedProcess(["bash"], 0, stdout="ACTIVE\n", stderr=""),
+            ), patch.object(engine.dispatcher, "dispatch_task", side_effect=fake_dispatch):
+                res = engine.execute_turn("T-AUTOCOMMIT", "codex-1", "implementer", timeout_sec=120)
+
+            self.assertEqual(res["status"], "SUCCESS")
+            task = engine.tasks["T-AUTOCOMMIT"]
+            self.assertIsNotNone(task.candidate_commit)
+            self.assertNotEqual(task.candidate_commit, base_head)
+
+            # Worktree must be clean for worktree-gate.sh review require_clean
+            porcelain = subprocess.check_output(
+                ["git", "status", "--porcelain"], cwd=seat_wt, text=True
+            ).strip()
+            self.assertEqual(porcelain, "")
+
+            # Code files committed, runner logs excluded and removed
+            committed_files = subprocess.check_output(
+                ["git", "ls-tree", "-r", "--name-only", task.candidate_commit],
+                cwd=seat_wt,
+                text=True,
+            ).splitlines()
+            self.assertIn("index.html", committed_files)
+            self.assertIn("style.css", committed_files)
+            self.assertIn("script.js", committed_files)
+            self.assertNotIn(".openrig-codex-seat.log", committed_files)
+            self.assertFalse((seat_wt / ".openrig-codex-seat.log").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

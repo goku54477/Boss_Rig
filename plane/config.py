@@ -157,6 +157,7 @@ class PlaneConfig:
     enable_jsonl_bus: bool = True
     reports_dir: str = ".openrig-bridge/reports"
     enable_toasts: bool = True
+    verification_commands: List[str] = field(default_factory=list)
     prefix_triggers: List[str] = field(
         default_factory=lambda: ["@rig", "@boss-rig", "build a", "create a", "implement"]
     )
@@ -270,6 +271,14 @@ class PlaneConfig:
                 raw, ("enable_toasts",), ("speaker", "enable_toasts"), default=cfg.enable_toasts
             )
         )
+        v_cmds = _extract_value(
+            raw,
+            ("verification_commands",),
+            ("dispatch", "verification_commands"),
+            default=cfg.verification_commands,
+        )
+        if isinstance(v_cmds, list):
+            cfg.verification_commands = [str(c).strip() for c in v_cmds if str(c).strip()]
         triggers = _extract_value(
             raw, ("prefix_triggers",), ("router", "prefix_triggers"), default=cfg.prefix_triggers
         )

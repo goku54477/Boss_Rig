@@ -1404,6 +1404,47 @@ class TestLiveSessionRegressions(unittest.TestCase):
             self.assertEqual(spec.assigned_agents["implementer"], "codex-1")
             self.assertEqual(Path(spec.repo).resolve(), sandbox_repo.resolve())
 
+    def test_spec_builder_defaults_verification_commands_to_empty_and_respects_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sandbox_repo = tmp_path / ".disposable-live-repo"
+            _init_git_repo(sandbox_repo)
+            cfg_default = PlaneConfig(
+                default_repo=str(sandbox_repo),
+                sandbox_repos=[str(sandbox_repo)],
+                enabled_agents=["opencode-1", "codex-1", "antigravity-1"],
+            )
+            self.assertEqual(cfg_default.verification_commands, [])
+            builder_default = SpecBuilder(config=cfg_default, extra_allowed_repos=[sandbox_repo])
+            msg = PlaneMessage(
+                id="m-pomodoro",
+                source="goldfish",
+                conversation_id="conv-pomo",
+                role="user",
+                text="Build a Pomodoro web app using codex",
+            )
+            decision = RoutingDecision(
+                action="PROPOSE_BUILD",
+                confidence=0.95,
+                target_agent="codex-1",
+                reason="Build request",
+                router_name="laya",
+            )
+            spec_default = builder_default.build(msg, decision)
+            self.assertEqual(spec_default.verification_commands, [])
+
+            yaml_path = tmp_path / "plane.yaml"
+            yaml_path.write_text(
+                f"default_repo: {sandbox_repo}\nverification_commands: [\"pytest -q\"]\n",
+                encoding="utf-8",
+            )
+            cfg_custom = PlaneConfig.load(yaml_path)
+            self.assertEqual(cfg_custom.verification_commands, ["pytest -q"])
+            spec_custom = SpecBuilder(config=cfg_custom, extra_allowed_repos=[sandbox_repo]).build(
+                msg, decision
+            )
+            self.assertEqual(spec_custom.verification_commands, ["pytest -q"])
+
 
 if __name__ == "__main__":
     unittest.main()

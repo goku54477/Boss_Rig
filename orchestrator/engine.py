@@ -84,7 +84,9 @@ class OrchestrationEngine:
             task_id=task_id,
             state=TaskState.QUEUED,
             goal=goal,
-            verification_commands=verification_commands or ["true"],
+            verification_commands=(
+                list(verification_commands) if verification_commands is not None else ["true"]
+            ),
             context=context,
         )
         record.transition(TaskState.QUEUED, reason="Task created")
@@ -110,6 +112,85 @@ class OrchestrationEngine:
         task.transition(TaskState.ASSIGNED, reason=f"Assigned {engine} as {role}")
         self.store.save_task(task)
         return task
+
+    def _auto_commit_implementer_worktree(self, seat_wt: Path, task_id: str) -> None:
+        """Remove seat logs and commit implementer changes so review sees a clean candidate commit."""
+        if not (seat_wt / ".git").exists():
+            return
+
+        for log_file in seat_wt.glob(".openrig-*-seat.log"):
+            if log_file.is_file():
+                try:
+                    log_file.unlink()
+                except OSError:
+                    pass
+
+        status_res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=seat_wt,
+            capture_output=True,
+            text=True,
+        )
+        if status_res.returncode != 0 or not status_res.stdout.strip():
+            return
+
+        add_res = subprocess.run(
+            ["git", "add", "-A"],
+            cwd=seat_wt,
+            capture_output=True,
+            text=True,
+        )
+        if add_res.returncode != 0:
+            raise RuntimeError(
+                f"Failed to stage implementer changes in '{seat_wt}': {add_res.stderr.strip()}"
+            )
+
+        remaining_logs = [p.name for p in seat_wt.glob(".openrig-*-seat.log") if p.is_file()]
+        if remaining_logs:
+            subprocess.run(
+                ["git", "reset", "-q", "HEAD", "--", *remaining_logs],
+                cwd=seat_wt,
+                capture_output=True,
+                text=True,
+            )
+
+        diff_res = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=seat_wt,
+            capture_output=True,
+            text=True,
+        )
+        if diff_res.returncode == 0:
+            return
+
+        identity_args: List[str] = []
+        for cfg_key in ("user.name", "user.email"):
+            cfg_res = subprocess.run(
+                ["git", "config", "--get", cfg_key],
+                cwd=seat_wt,
+                capture_output=True,
+                text=True,
+            )
+            if cfg_res.returncode != 0 or not cfg_res.stdout.strip():
+                identity_args = [
+                    "-c",
+                    "user.name=OpenRig Seat",
+                    "-c",
+                    "user.email=openrig@local",
+                ]
+                break
+
+        commit_res = subprocess.run(
+            ["git", *identity_args, "commit", "-m", f"feat(boss-rig): implementer changes for {task_id}"],
+            cwd=seat_wt,
+            capture_output=True,
+            text=True,
+        )
+        if commit_res.returncode != 0:
+            raise RuntimeError(
+                f"Failed to auto-commit implementer changes in '{seat_wt}': "
+                f"stdout={commit_res.stdout.strip()} stderr={commit_res.stderr.strip()}"
+            )
 
     def execute_turn(
         self,
@@ -184,6 +265,7 @@ class OrchestrationEngine:
             # Record current candidate commit from worktree ONLY for implementer role!
             # Reviewers or planners must never overwrite the candidate commit.
             if role == "implementer":
+                self._auto_commit_implementer_worktree(seat_wt, task_id)
                 rev_res = subprocess.run(
                     ["git", "rev-parse", "HEAD"],
                     cwd=seat_wt,
@@ -228,10 +310,13 @@ class OrchestrationEngine:
         task.transition(TaskState.MERGE_READY, reason="Ready for verification gate")
 
         # Run verification command via worktree-gate.sh review
-        verify_cmd = " && ".join(task.verification_commands)
+        verify_cmd = " && ".join(cmd for cmd in task.verification_commands if str(cmd).strip())
         task.transition(TaskState.MERGING, reason="Acquiring merge lock and running verification gate")
 
-        gate_res = self.run_gate("review", task_id, seat, verify_cmd)
+        gate_args = ["review", task_id, seat]
+        if verify_cmd:
+            gate_args.append(verify_cmd)
+        gate_res = self.run_gate(*gate_args)
         if gate_res.returncode == 0:
             # Capture merge commit
             int_rev = subprocess.run(

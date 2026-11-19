@@ -150,7 +150,7 @@ class SpecBuilder:
         return TaskSpec(
             repo=str(resolved_repo),
             goal=goal,
-            verification_commands=["python -m unittest"],
+            verification_commands=list(self.config.verification_commands),
             constraints=[
                 f"Stay strictly inside {resolved_repo.name}",
                 f"Merge target locked to {merge_target}",

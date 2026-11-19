@@ -12,7 +12,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 from orchestrator.models import BridgeEvent, SeatMode, TaskEnvelope
-from orchestrator.security import to_wsl_path
+from orchestrator.security import kill_process_tree, to_wsl_path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKTREES_DIR = REPO_ROOT / ".worktrees"
@@ -162,17 +162,24 @@ class SeatBridgeProcess:
     def is_alive(self) -> bool:
         return self.proc.poll() is None
 
-    def close(self) -> None:
+    def close(self, force: bool = False) -> None:
         if self.is_alive():
-            try:
-                self.send_line(":quit")
-                self.proc.wait(timeout=2)
-            except Exception:
+            terminated = False
+            if not force:
                 try:
-                    self.proc.kill()
+                    self.send_line(":quit")
                     self.proc.wait(timeout=2)
+                    terminated = True
                 except Exception:
-                    pass
+                    terminated = False
+            if not terminated:
+                kill_process_tree(self.proc.pid)
+                if self.is_alive():
+                    try:
+                        self.proc.kill()
+                        self.proc.wait(timeout=2)
+                    except Exception:
+                        pass
         if self.proc.stdin:
             try:
                 self.proc.stdin.close()
@@ -224,6 +231,12 @@ class TaskDispatcher:
         self.active_bridges[engine] = bridge
         return bridge
 
+    def _evict_bridge(self, engine: str, bridge: SeatBridgeProcess, force: bool = True) -> None:
+        """Close and evict a timed-out or unhealthy seat bridge so no orphan work continues."""
+        if self.active_bridges.get(engine) is bridge:
+            self.active_bridges.pop(engine, None)
+        bridge.close(force=force)
+
     def dispatch_task(
         self,
         engine: str,
@@ -258,11 +271,14 @@ class TaskDispatcher:
         # Wait for terminal event: task_result, task_timeout, or task_failed
         term_evt = _read_evt("task_result", float(timeout))
         if not term_evt:
+            self._evict_bridge(engine, bridge, force=True)
             return {
                 "status": "TIMEOUT",
                 "error": f"Task timed out after {timeout} seconds",
                 "exit_code": 124,
             }
+        if term_evt.get("event") == "task_timeout" or term_evt.get("status") == "TIMEOUT":
+            self._evict_bridge(engine, bridge, force=False)
 
         return term_evt
 
