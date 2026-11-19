@@ -137,9 +137,19 @@ class SpecBuilder:
             planner=planner,
         )
 
+        goal = _clean_goal_text(msg.text)
+        clean_ctx = [
+            turn.strip()
+            for turn in (msg.recent_context or [])
+            if turn and "[SHARED PLANE" not in turn
+        ]
+        if clean_ctx:
+            ctx_block = "\n".join(f"- {turn}" for turn in clean_ctx[-3:])
+            goal = f"{goal}\n\nRecent Goldfish context:\n{ctx_block}"[:1500]
+
         return TaskSpec(
             repo=str(resolved_repo),
-            goal=_clean_goal_text(msg.text),
+            goal=goal,
             verification_commands=["python -m unittest"],
             constraints=[
                 f"Stay strictly inside {resolved_repo.name}",

@@ -12,6 +12,7 @@ from plane.config import PlaneConfig
 from plane.schemas import PlaneMessage, RoutingDecision, VALID_ACTIONS
 
 REPORT_MARKER = "[SHARED PLANE REPORT"
+SHARED_PLANE_MARKERS = (REPORT_MARKER, "[SHARED PLANE]")
 
 AGENT_DESCRIPTIONS: Dict[str, str] = {
     "opencode-1": "opencode-1 autonomous coding agent for general implementation tasks",
@@ -69,9 +70,10 @@ def _prefilter_message(msg: PlaneMessage) -> Tuple[Optional[str], str]:
     """Enforce loop-of-doom safety filters before invoking any router."""
     if msg.role != "user":
         return None, f"Ignored non-user role '{msg.role}'"
-    if REPORT_MARKER in (msg.text or ""):
-        return None, "Ignored Shared Plane report marker"
-    sanitized = strip_quotes_and_codeblocks(msg.text or "").strip()
+    raw_text = msg.text or ""
+    if any(marker in raw_text for marker in SHARED_PLANE_MARKERS):
+        return None, "Ignored Shared Plane report/log marker"
+    sanitized = strip_quotes_and_codeblocks(raw_text).strip()
     if not sanitized:
         return None, "Ignored empty/quoted-only message"
     return sanitized, ""
@@ -219,8 +221,10 @@ class LayaRouter(BaseRouter):
         backend: Optional[Any] = None,
         router_cls: Optional[Any] = None,
         fallback_router: Optional[BaseRouter] = None,
+        action_threshold: Optional[float] = None,
     ) -> None:
         self.threshold = float(threshold)
+        self.action_threshold = float(action_threshold if action_threshold is not None else threshold)
         self.enabled_agents = list(enabled_agents or ["opencode-1", "codex-1", "antigravity-1"])
         self.default_agent = (
             default_agent
@@ -274,10 +278,12 @@ class LayaRouter(BaseRouter):
             },
         }
 
-    def _parse_backend_output(self, raw: Any) -> Tuple[float, Optional[bool], str, str]:
+    def _parse_backend_output(
+        self, raw: Any
+    ) -> Tuple[float, Optional[bool], str, Optional[float], Optional[float], str]:
         """Support both Laya 0.4.31 Router.predict (`answers` dict) and flat test mocks."""
         if not isinstance(raw, dict):
-            return 0.0, False, "IGNORE", self.default_agent
+            return 0.0, False, "IGNORE", None, None, self.default_agent
 
         answers = raw.get("answers") if isinstance(raw.get("answers"), dict) else raw
 
@@ -300,8 +306,22 @@ class LayaRouter(BaseRouter):
 
         action_entry = answers.get("action")
         raw_action = "IGNORE"
-        if isinstance(action_entry, dict) and action_entry.get("choice"):
-            raw_action = str(action_entry["choice"])
+        action_prob: Optional[float] = None
+        propose_build_prob: Optional[float] = None
+        if isinstance(action_entry, dict):
+            if action_entry.get("choice"):
+                raw_action = str(action_entry["choice"])
+            probs = action_entry.get("probabilities")
+            if isinstance(probs, dict):
+                if raw_action in probs:
+                    action_prob = float(probs[raw_action])
+                if "PROPOSE_BUILD" in probs:
+                    propose_build_prob = float(probs["PROPOSE_BUILD"])
+            if action_prob is None:
+                if "answer_confidence" in action_entry:
+                    action_prob = float(action_entry["answer_confidence"])
+                elif "probability" in action_entry:
+                    action_prob = float(action_entry["probability"])
         elif isinstance(action_entry, str):
             raw_action = action_entry
         if raw_action not in VALID_ACTIONS:
@@ -316,7 +336,7 @@ class LayaRouter(BaseRouter):
         if raw_target not in self.enabled_agents:
             raw_target = self.default_agent
 
-        return build_prob, build_answer, raw_action, raw_target
+        return build_prob, build_answer, raw_action, action_prob, propose_build_prob, raw_target
 
     def classify(self, msg: PlaneMessage) -> RoutingDecision:
         started = time.perf_counter()
@@ -331,9 +351,8 @@ class LayaRouter(BaseRouter):
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
 
+        # Classify strictly on the current user message so prior chat turns cannot poison System-1 heads.
         state: Dict[str, Any] = {"message": sanitized}
-        if msg.recent_context:
-            state["recent_context"] = msg.recent_context[-3:]
         questions = self._build_questions()
 
         try:
@@ -346,25 +365,69 @@ class LayaRouter(BaseRouter):
                 return self._fallback_router.classify(msg)
             raise
 
-        build_prob, build_answer, raw_action, target_agent = self._parse_backend_output(raw)
+        (
+            build_prob,
+            build_answer,
+            raw_action,
+            action_prob,
+            propose_build_prob,
+            target_agent,
+        ) = self._parse_backend_output(raw)
         latency_ms = (time.perf_counter() - started) * 1000.0
 
-        if raw_action in ("ANSWER_QUESTION", "CHECK_STATUS"):
-            return RoutingDecision(
-                action=raw_action,
-                confidence=max(build_prob, 0.75),
-                target_agent=target_agent,
-                reason=f"Laya classified {raw_action}",
-                router_name="laya",
-                latency_ms=latency_ms,
-            )
+        is_strong_build = build_prob >= self.threshold and build_answer is not False
+        effective_action_prob = action_prob if action_prob is not None else 1.0
+        is_strong_non_build = (
+            raw_action in ("ANSWER_QUESTION", "CHECK_STATUS")
+            and effective_action_prob >= self.action_threshold
+        )
 
-        if raw_action == "PROPOSE_BUILD" and build_prob >= self.threshold and build_answer is not False:
+        if is_strong_build:
+            if is_strong_non_build and (
+                propose_build_prob is None or effective_action_prob > propose_build_prob
+            ):
+                return RoutingDecision(
+                    action=raw_action,
+                    confidence=effective_action_prob,
+                    target_agent=target_agent,
+                    reason=(
+                        f"Laya classified {raw_action} "
+                        f"({effective_action_prob:.2f} >= {self.action_threshold:.2f})"
+                    ),
+                    router_name="laya",
+                    latency_ms=latency_ms,
+                )
+            if (
+                raw_action == "IGNORE"
+                and action_prob is not None
+                and action_prob >= self.action_threshold
+            ):
+                return RoutingDecision(
+                    action="IGNORE",
+                    confidence=action_prob,
+                    target_agent=target_agent,
+                    reason=f"Laya classified IGNORE ({action_prob:.2f} >= {self.action_threshold:.2f})",
+                    router_name="laya",
+                    latency_ms=latency_ms,
+                )
             return RoutingDecision(
                 action="PROPOSE_BUILD",
                 confidence=build_prob,
                 target_agent=target_agent,
                 reason=f"Laya build probability {build_prob:.2f} >= {self.threshold:.2f}",
+                router_name="laya",
+                latency_ms=latency_ms,
+            )
+
+        if is_strong_non_build:
+            return RoutingDecision(
+                action=raw_action,
+                confidence=effective_action_prob,
+                target_agent=target_agent,
+                reason=(
+                    f"Laya classified {raw_action} "
+                    f"({effective_action_prob:.2f} >= {self.action_threshold:.2f})"
+                ),
                 router_name="laya",
                 latency_ms=latency_ms,
             )

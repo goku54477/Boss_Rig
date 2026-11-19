@@ -13,6 +13,11 @@ from orchestrator.store import TaskStore
 from plane.schemas import PlaneMessage
 
 REPORT_MARKER = "[SHARED PLANE REPORT"
+SHARED_PLANE_MARKERS = (REPORT_MARKER, "[SHARED PLANE]")
+
+
+def _contains_shared_plane_marker(text: str) -> bool:
+    return any(marker in text for marker in SHARED_PLANE_MARKERS)
 
 
 def _extract_text(content: Any) -> str:
@@ -164,13 +169,13 @@ class GoldfishChatListener(BaseListener):
                     continue
 
                 text = _extract_text(msg.get("content", ""))
-                if REPORT_MARKER in text:
+                if _contains_shared_plane_marker(text):
                     self.store.claim_event_durable(
                         event_id=msg_id_str,
                         chat_id=chat_id,
                         action="PLANE_IGNORED",
                         status="IGNORED",
-                        detail="Ignored Shared Plane report marker",
+                        detail="Ignored Shared Plane report/log marker",
                     )
                     continue
 
@@ -181,7 +186,7 @@ class GoldfishChatListener(BaseListener):
                         if not isinstance(prev, dict):
                             continue
                         prev_text = _extract_text(prev.get("content", "")).strip()
-                        if prev_text and REPORT_MARKER not in prev_text:
+                        if prev_text and not _contains_shared_plane_marker(prev_text):
                             context.append(f"{prev.get('role', 'unknown')}: {prev_text[:280]}")
 
                 raw_ts = msg.get("createdAt")
@@ -258,7 +263,7 @@ class JsonlBusListener(BaseListener):
             if obj.get("role", "user") != "user" or self.store.is_event_claimed(msg_id):
                 continue
             text = _extract_text(obj.get("text") or obj.get("content") or "")
-            if not text.strip() or REPORT_MARKER in text:
+            if not text.strip() or _contains_shared_plane_marker(text):
                 continue
             conv_id = str(obj.get("conversation_id") or "bus")
             if not self.store.claim_event_durable(

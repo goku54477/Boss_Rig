@@ -1099,5 +1099,311 @@ class TestSharedPlaneDaemonE2E(unittest.TestCase):
             self.assertIn("integration", sb_check["detail"])
 
 
+class TestLiveSessionRegressions(unittest.TestCase):
+    def test_laya_router_does_not_pass_recent_context_to_backend(self) -> None:
+        fake = FakeLayaBackend(
+            {
+                "answers": {
+                    "is_build_task": {"type": "noul", "noul": 0.8212},
+                    "action": {
+                        "type": "choice",
+                        "choice": "PROPOSE_BUILD",
+                        "probabilities": {
+                            "IGNORE": 0.114,
+                            "PROPOSE_BUILD": 0.7859,
+                            "ANSWER_QUESTION": 0.0558,
+                            "CHECK_STATUS": 0.0443,
+                        },
+                    },
+                    "target_agent": {"type": "choice", "choice": "codex-1"},
+                }
+            }
+        )
+        router = LayaRouter(
+            threshold=0.75,
+            enabled_agents=["opencode-1", "codex-1", "antigravity-1"],
+            backend=fake,
+        )
+        msg = PlaneMessage(
+            id="5a07ba58-29e7-4d56-b0f6-379a86df0138",
+            source="goldfish",
+            conversation_id="ab7b206a",
+            role="user",
+            text=(
+                "Build a Pomodoro web app inspired by Pomofocus in the disposable sandbox repo "
+                "using codex-1. Queue it for my approval before editing any files. No merge or push."
+            ),
+            recent_context=[
+                "user: [SHARED PLANE] [{'action': 'CHECK_STATUS'}]",
+                "assistant: Shared Plane shows CHECK_STATUS with 0 tasks",
+            ],
+        )
+        decision = router.classify(msg)
+        self.assertEqual(decision.action, "PROPOSE_BUILD")
+        self.assertEqual(decision.target_agent, "codex-1")
+        state_sent = fake.last_call[0]
+        self.assertEqual(state_sent, {"message": msg.text})
+        self.assertNotIn("recent_context", state_sent)
+
+    def test_laya_router_action_precedence_and_confidence_gate(self) -> None:
+        # 1. Poisoned 5a07ba58 shape: strong is_build_task (0.8105) + weak CHECK_STATUS (0.3978)
+        router_poison = LayaRouter(
+            threshold=0.75,
+            enabled_agents=["opencode-1", "codex-1", "antigravity-1"],
+            backend=FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"type": "noul", "noul": 0.8105},
+                        "action": {
+                            "type": "choice",
+                            "choice": "CHECK_STATUS",
+                            "probabilities": {
+                                "IGNORE": 0.0987,
+                                "PROPOSE_BUILD": 0.3041,
+                                "ANSWER_QUESTION": 0.1993,
+                                "CHECK_STATUS": 0.3978,
+                            },
+                            "answer_confidence": 0.3978,
+                        },
+                        "target_agent": {"type": "choice", "choice": "codex-1"},
+                    }
+                }
+            ),
+        )
+        m_build = PlaneMessage(
+            id="5a07ba58-29e7-4d56-b0f6-379a86df0138",
+            source="goldfish",
+            conversation_id="ab7b206a",
+            role="user",
+            text="Build a Pomodoro web app inspired by Pomofocus using codex-1.",
+        )
+        dec_build = router_poison.classify(m_build)
+        self.assertEqual(dec_build.action, "PROPOSE_BUILD")
+        self.assertEqual(dec_build.target_agent, "codex-1")
+        self.assertGreaterEqual(dec_build.confidence, 0.81)
+
+        # 2. Weak CHECK_STATUS with low is_build_task -> MUST return IGNORE (not CHECK_STATUS)
+        router_weak_status = LayaRouter(
+            threshold=0.75,
+            backend=FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"type": "noul", "noul": 0.1933},
+                        "action": {
+                            "type": "choice",
+                            "choice": "CHECK_STATUS",
+                            "probabilities": {
+                                "IGNORE": 0.284,
+                                "PROPOSE_BUILD": 0.1649,
+                                "ANSWER_QUESTION": 0.2393,
+                                "CHECK_STATUS": 0.3118,
+                            },
+                            "answer_confidence": 0.3118,
+                        },
+                        "target_agent": {"type": "choice", "choice": "codex-1"},
+                    }
+                }
+            ),
+        )
+        self.assertEqual(router_weak_status.classify(m_build).action, "IGNORE")
+
+        # 3. High-confidence CHECK_STATUS (0.85 >= 0.75) with low is_build_task -> CHECK_STATUS
+        router_strong_status = LayaRouter(
+            threshold=0.75,
+            backend=FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"type": "noul", "noul": 0.05},
+                        "action": {
+                            "type": "choice",
+                            "choice": "CHECK_STATUS",
+                            "probabilities": {
+                                "IGNORE": 0.08,
+                                "PROPOSE_BUILD": 0.04,
+                                "ANSWER_QUESTION": 0.03,
+                                "CHECK_STATUS": 0.85,
+                            },
+                            "answer_confidence": 0.85,
+                        },
+                        "target_agent": {"type": "choice", "choice": "opencode-1"},
+                    }
+                }
+            ),
+        )
+        dec_status = router_strong_status.classify(
+            PlaneMessage(
+                id="status-1",
+                source="goldfish",
+                conversation_id="ab7b206a",
+                role="user",
+                text="Check status of my tasks",
+            )
+        )
+        self.assertEqual(dec_status.action, "CHECK_STATUS")
+        self.assertAlmostEqual(dec_status.confidence, 0.85)
+
+        # 4. Clean Laya shapes for fb254626 (IGNORE) and e7399aa7 (PROPOSE_BUILD)
+        router_fb25 = LayaRouter(
+            threshold=0.75,
+            backend=FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"type": "noul", "noul": 0.0005},
+                        "action": {
+                            "type": "choice",
+                            "choice": "IGNORE",
+                            "probabilities": {
+                                "IGNORE": 0.5754,
+                                "PROPOSE_BUILD": 0.0423,
+                                "ANSWER_QUESTION": 0.2606,
+                                "CHECK_STATUS": 0.1217,
+                            },
+                        },
+                        "target_agent": {"type": "choice", "choice": "opencode-1"},
+                    }
+                }
+            ),
+        )
+        self.assertEqual(
+            router_fb25.classify(
+                PlaneMessage(
+                    id="fb254626-de37-43f2-a9cb-afb966e2525b",
+                    source="goldfish",
+                    conversation_id="ab7b206a",
+                    role="user",
+                    text="Hey goldfish did you see teh pomodaro clock which I opened?",
+                )
+            ).action,
+            "IGNORE",
+        )
+
+        router_e739 = LayaRouter(
+            threshold=0.75,
+            enabled_agents=["opencode-1", "codex-1", "antigravity-1"],
+            backend=FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"type": "noul", "noul": 0.8874},
+                        "action": {
+                            "type": "choice",
+                            "choice": "PROPOSE_BUILD",
+                            "probabilities": {
+                                "IGNORE": 0.0928,
+                                "PROPOSE_BUILD": 0.6516,
+                                "ANSWER_QUESTION": 0.1732,
+                                "CHECK_STATUS": 0.0824,
+                            },
+                        },
+                        "target_agent": {"type": "choice", "choice": "codex-1"},
+                    }
+                }
+            ),
+        )
+        dec_e739 = router_e739.classify(
+            PlaneMessage(
+                id="e7399aa7-ec46-441f-943f-37436aaa8b36",
+                source="goldfish",
+                conversation_id="ab7b206a",
+                role="user",
+                text="Great , So I want to code and build it using codex and exactly same you tell it to the rig",
+            )
+        )
+        self.assertEqual(dec_e739.action, "PROPOSE_BUILD")
+        self.assertEqual(dec_e739.target_agent, "codex-1")
+
+    def test_shared_plane_log_pastes_filtered_in_listener_and_router(self) -> None:
+        log_paste_1 = (
+            "return Agent(repo, **kwargs)\n"
+            "[SHARED PLANE] [{'action': 'CHECK_STATUS', 'message_id': 'a192e9f0-c48d-46fc-9ddc-274aa0a30199'}]"
+        )
+        log_paste_2 = (
+            "nope nothing yet ,\nhere are the logs \n\n"
+            "[SHARED PLANE] [{'action': 'CHECK_STATUS', 'message_id': '5a07ba58-29e7-4d56-b0f6-379a86df0138'}]"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            chats_dir = Path(tmp) / "chats"
+            chats_dir.mkdir()
+            store = TaskStore(db_path=Path(tmp) / "tasks.sqlite")
+            listener = GoldfishChatListener(chats_dir=chats_dir, store=store)
+            listener.baseline()
+
+            (chats_dir / "ab7b206a.json").write_text(
+                json.dumps(
+                    {
+                        "id": "ab7b206a",
+                        "messages": [
+                            {"id": "fb12ced1-4e2a-437a-a21d-e2499063dafc", "role": "user", "content": log_paste_1},
+                            {"id": "asst-pomofocus", "role": "assistant", "content": "Yep, you opened Pomofocus in Edge at 25:00."},
+                            {"id": "ace9fcf2-f6dc-4167-8452-20d3e078325c", "role": "user", "content": log_paste_2},
+                            {
+                                "id": "5a07ba58-29e7-4d56-b0f6-379a86df0138",
+                                "role": "user",
+                                "content": "Build a Pomodoro web app inspired by Pomofocus using codex-1.",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            emitted = listener.poll()
+            self.assertEqual([m.id for m in emitted], ["5a07ba58-29e7-4d56-b0f6-379a86df0138"])
+            self.assertTrue(all("[SHARED PLANE]" not in ctx for ctx in emitted[0].recent_context))
+            self.assertTrue(any("Pomofocus" in ctx for ctx in emitted[0].recent_context))
+
+        fake = FakeLayaBackend(
+            {
+                "answers": {
+                    "is_build_task": {"noul": 0.99},
+                    "action": {"choice": "PROPOSE_BUILD"},
+                    "target_agent": {"choice": "opencode-1"},
+                }
+            }
+        )
+        laya_router = LayaRouter(threshold=0.75, backend=fake)
+        heur_router = HeuristicRouter()
+        for mid, txt in (
+            ("fb12ced1-4e2a-437a-a21d-e2499063dafc", log_paste_1),
+            ("ace9fcf2-f6dc-4167-8452-20d3e078325c", log_paste_2),
+        ):
+            msg = PlaneMessage(id=mid, source="goldfish", conversation_id="ab7b206a", role="user", text=txt)
+            self.assertEqual(laya_router.classify(msg).action, "IGNORE")
+            self.assertEqual(heur_router.classify(msg).action, "IGNORE")
+        self.assertIsNone(fake.last_call)
+
+    def test_spec_builder_preserves_recent_context_for_agent_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox_repo = Path(tmp) / ".disposable-live-repo"
+            _init_git_repo(sandbox_repo)
+            cfg = PlaneConfig(
+                default_repo=str(sandbox_repo),
+                sandbox_repos=[str(sandbox_repo)],
+                enabled_agents=["opencode-1", "codex-1", "antigravity-1"],
+            )
+            builder = SpecBuilder(config=cfg, extra_allowed_repos=[sandbox_repo])
+            msg = PlaneMessage(
+                id="e7399aa7-ec46-441f-943f-37436aaa8b36",
+                source="goldfish",
+                conversation_id="ab7b206a",
+                role="user",
+                text="Great , So I want to code and build it using codex and exactly same you tell it to the rig",
+                recent_context=[
+                    r"user: I checked C:\Windows\System32 earlier",
+                    "assistant: Yep, you opened Pomofocus in Edge. It was at 25:00 with START still showing.",
+                ],
+            )
+            decision = RoutingDecision(
+                action="PROPOSE_BUILD",
+                confidence=0.8874,
+                target_agent="codex-1",
+                reason="Laya build intent",
+                router_name="laya",
+            )
+            spec = builder.build(msg, decision)
+            self.assertTrue(spec.goal.startswith("Great , So I want to code and build it using codex"))
+            self.assertIn("Pomofocus", spec.goal)
+            self.assertEqual(spec.assigned_agents["implementer"], "codex-1")
+            self.assertEqual(Path(spec.repo).resolve(), sandbox_repo.resolve())
+
+
 if __name__ == "__main__":
     unittest.main()
