@@ -111,7 +111,7 @@ paths:
                 repo:
                   type: string
                   description: Absolute path to the allowed local repository.
-                  example: "C:/Users/jacob/Boss Agent/.disposable-live-repo"
+                  example: "<REPO_ROOT>/.disposable-live-repo"
                 goal:
                   type: string
                   description: Clear, concise goal description for the multi-agent rig.

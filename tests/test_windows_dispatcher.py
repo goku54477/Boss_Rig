@@ -35,8 +35,8 @@ def _init_temp_git_repo(repo_dir: Path) -> None:
 class TestWindowsDispatcherAndStages(unittest.TestCase):
     def test_to_wsl_path_conversion(self) -> None:
         self.assertEqual(
-            to_wsl_path(r"C:\Users\jacob\Boss Agent\scripts\worktree-gate.sh", platform="win32"),
-            "/mnt/c/Users/jacob/Boss Agent/scripts/worktree-gate.sh",
+            to_wsl_path(r"C:\Users\dev\Boss Agent\scripts\worktree-gate.sh", platform="win32"),
+            "/mnt/c/Users/dev/Boss Agent/scripts/worktree-gate.sh",
         )
         self.assertEqual(
             to_wsl_path("D:/repos/my app/file.py", platform="win32"),
@@ -44,13 +44,13 @@ class TestWindowsDispatcherAndStages(unittest.TestCase):
         )
         # No double conversion if already POSIX / /mnt/...
         self.assertEqual(
-            to_wsl_path("/mnt/c/Users/jacob/Boss Agent", platform="win32"),
-            "/mnt/c/Users/jacob/Boss Agent",
+            to_wsl_path("/mnt/c/Users/dev/Boss Agent", platform="win32"),
+            "/mnt/c/Users/dev/Boss Agent",
         )
         # No-op on Linux
         self.assertEqual(
-            to_wsl_path(r"C:\Users\jacob\Boss Agent", platform="linux"),
-            r"C:\Users\jacob\Boss Agent",
+            to_wsl_path(r"C:\Users\dev\Boss Agent", platform="linux"),
+            r"C:\Users\dev\Boss Agent",
         )
 
     def test_seat_bridge_process_reads_events_and_handles_eof_without_set_blocking(self) -> None:

@@ -22,6 +22,9 @@ dispatch:
   sandbox_repos:
     - ".disposable-live-repo"
   allowed_merge_target: "integration"
+  # Empty [] lets worktree-gate.sh auto-detect project test suites (package.json, pyproject.toml)
+  # or pass cleanly on static HTML/CSS/JS builds.
+  verification_commands: []
   poll_interval_sec: 0.5
 
 agents:

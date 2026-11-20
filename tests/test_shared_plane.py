@@ -37,7 +37,7 @@ class TestPlaneSchemasAndConfig(unittest.TestCase):
         report = BuildReport(
             task_id="T-100",
             status="DONE",
-            repo="C:/Users/jacob/Boss Agent/.disposable-live-repo",
+            repo="C:/Users/dev/Boss Agent/.disposable-live-repo",
             goal="Build a CLI calculator",
             candidate_commit="abc1234",
             merge_commit="def5678",

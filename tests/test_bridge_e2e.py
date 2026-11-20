@@ -151,8 +151,8 @@ class TestBossRigBridgeE2E(unittest.TestCase):
 
         # Initialize disposable git repo with main and integration branches
         subprocess.run(["git", "init"], cwd=self.repo_dir, check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Test Jacob"], cwd=self.repo_dir, check=True)
-        subprocess.run(["git", "config", "user.email", "jacob@example.com"], cwd=self.repo_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test Operator"], cwd=self.repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "operator@example.com"], cwd=self.repo_dir, check=True)
 
         readme = self.repo_dir / "README.md"
         readme.write_text("# Disposable Repo\n", encoding="utf-8")

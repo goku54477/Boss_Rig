@@ -108,7 +108,7 @@ sequenceDiagram
 
 ## 4. Policy Engine & Guardrails
 
-The policy engine ([orchestrator/policy.py](file:///c:/Users/jacob/Boss%20Agent/orchestrator/policy.py)) enforces three mandatory invariants:
+The policy engine ([orchestrator/policy.py](../orchestrator/policy.py)) enforces three mandatory invariants:
 
 ### 1. Independent Review Policy
 ```python
@@ -132,7 +132,7 @@ Seats are verified against task requirement envelopes:
 
 ## 5. Deterministic Verification Gate
 
-The verification gate is implemented in [scripts/worktree-gate.sh](file:///c:/Users/jacob/Boss%20Agent/scripts/worktree-gate.sh).
+The verification gate is implemented in [scripts/worktree-gate.sh](../scripts/worktree-gate.sh).
 
 ```mermaid
 flowchart TD

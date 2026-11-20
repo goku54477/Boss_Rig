@@ -6,51 +6,74 @@
 [![Git Worktrees](https://img.shields.io/badge/Isolation-Git%20Worktrees-orange.svg)](https://git-scm.com)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-**Boss Rig** is a local-first, non-invasive **Shared Plane** middleware and multi-agent coding orchestration harness built on **OpenRig (`0.7.19`)**.
+**Boss Rig** is a local-first **Shared Plane** conversational orchestration bridge built on **OpenRig (`0.7.19`)**.
 
-It connects natural conversation in **Goldfish Desktop** (or any JSONL-emitting brain) through a pluggable **Listener → Router → TaskService/OpenRig → Speaker** loop: screening build intent with **Laya (`0.4.31`, text-only `vega=False`)** or a zero-dependency heuristic fallback, dispatching isolated coding work across **`codex-1`**, **`opencode-1`**, and **`antigravity-1`** over isolated Git worktrees, and delivering `[SHARED PLANE REPORT]` artifacts without modifying Goldfish binaries or databases.
+It turns natural requests in **Goldfish Desktop** (or any JSONL-emitting brain) into verified Git commits in under 3 minutes: screening build intent in ~50ms via **Laya (`0.4.31`, text-only `vega=False`)** with zero-dependency heuristic fallback, enforcing HMAC-signed human approval in **`TaskService`**, dispatching isolated coding work across **`codex-1`**, **`antigravity-1`**, and **`opencode-1`** inside per-seat Git worktrees, and merging only after independent review and **`worktree-gate.sh`** deterministic verification pass.
 
 ---
 
-## ⚡ 3-Command Quickstart
+## ⚡ 60-Second Quickstart & 3-Terminal Runbook
 
 ```bash
 # 1. Create your declarative Shared Plane config
 cp plane.example.yaml plane.yaml
 
-# 2. Run read-only environment & seat diagnostics
+# 2. Run read-only environment & seat diagnostics (expects 8/8 [PASS])
 python -m plane.daemon doctor
-
-# 3. Start the Shared Plane Listener / Router / Speaker loop (dry-run by default; pass --live to enable proposals/dispatch)
-python -m plane.daemon up
 ```
 
-### Shared Plane Topology
+Run the live stack across three terminals:
+
+| Terminal | Component | Command |
+| :--- | :--- | :--- |
+| **Terminal 1** *(WSL)* | OpenRig Control Daemon (`:7433`) | `wsl -e bash -lc "rig daemon status \|\| rig daemon start"` |
+| **Terminal 2** *(Host)* | Companion Inbox UI & REST API (`:8383`) | `python -m orchestrator.bridge_cli serve --port 8383` → open `http://127.0.0.1:8383/inbox` |
+| **Terminal 3** *(Host)* | Shared Plane Listener / Router / Speaker | **Default (`propose_first`):** `python -m plane.daemon up --live`<br>**Hands-free sandbox opt-in:** `python -m plane.daemon up --live --auto-approve-sandbox` |
+
+### Shared Plane Architecture Flow
 
 ```mermaid
 flowchart LR
-    GF["Goldfish Desktop (read-only chats/*.json + goldfish.db)\nor External Brains (~/.boss-rig/bus.jsonl)"]
-    LIST["Shared Plane Listeners\n(GoldfishChatListener, JsonlBusListener)"]
-    LAYA["Intent Router\nLaya 0.4.31 (text-only vega=False)\nor HeuristicRouter Fallback"]
-    SPEC["SpecBuilder + PolicyEngine\n(propose_first default; sandbox opt-in)"]
-    SVC["Boss Rig TaskService\n(.openrig-bridge/tasks.sqlite)"]
-    SEATS["OpenRig 0.7.19 Seats\ncodex-1 | opencode-1 | antigravity-1"]
-    SPK["Speakers\nReportFileSpeaker (.openrig-bridge/reports/)\nToastNotificationSpeaker | /reports/latest | MCP"]
+    GF["Goldfish Desktop\n(Strictly Read-Only Chats + DB)"]
+    LIST["GoldfishChatListener\n(6-turn recent_context;\nstrips quotes & report markers)"]
+    LAYA["Laya 0.4.31 (~50ms)\n(Classifies isolated message only;\nHeuristicRouter fallback)"]
+    GATE_AUTH["HMAC-Signed Approval Gate\npropose_first (/inbox click)\nor --auto-approve-sandbox\n(.disposable-live-repo + integration only)"]
+    IMPL["codex-1 Implementer\n(.worktrees/codex-1\nauto-commit excluding seat logs)"]
+    REV["antigravity-1 Reviewer\n(Read-Only Role Guard;\nreviewer != implementer)"]
+    MERGE["worktree-gate.sh\n(Deterministic verify + merge\n-> .worktrees/_integration)"]
+    SPK["CompositeSpeaker\n(latest_report.md + Files Changed\n+ _integration path + Toasts + MCP)"]
 
     GF -->|Read-only poll| LIST
-    LIST --> LAYA
-    LAYA --> SPEC
-    SPEC --> SVC
-    SVC --> SEATS
-    SEATS -->|Candidate + Gate -> integration| SVC
-    SVC --> SPK
+    LIST -->|"message only"| LAYA
+    LIST -->|"6-turn Observed UI context"| GATE_AUTH
+    LAYA -->|PROPOSE_BUILD| GATE_AUTH
+    GATE_AUTH -->|Verified TaskSpec| IMPL
+    IMPL -->|Candidate SHA| REV
+    REV -->|PASS| MERGE
+    MERGE -->|integration commit| SPK
 ```
 
 ### Key Shared Plane Guarantees
-- **Strictly Read-Only Goldfish Boundary**: Reads `%APPDATA%\goldfish\chats\*.json` and `%APPDATA%\goldfish\goldfish.db` (`?mode=ro&immutable=1`) without ever writing to Goldfish files or modifying Goldfish Desktop.
-- **Safety-First Dispatch (`propose_first` default)**: Natural build requests create `PENDING_APPROVAL` proposals in `.openrig-bridge/tasks.sqlite` for one-click approval in Companion Inbox (`/inbox`). Optional `auto_dispatch_sandbox` in `plane.yaml` is strictly restricted to `.disposable-live-repo` on branch `integration`.
-- **Zero-Dependency Fallback**: Laya `0.4.31` (text-only, `vega=False`) is the default router, automatically falling back to `HeuristicRouter` when `laya` or model weights are unavailable offline.
-- **Loop-of-Doom Prevention**: Ignores `role != "user"`, strips Markdown blockquotes and fenced codeblocks, skips `[SHARED PLANE REPORT]` markers, and deduplicates every message ID in SQLite.
+- **Strictly Read-Only Goldfish Boundary**: Reads `<APPDATA>/goldfish/chats/*.json` and `goldfish.db` (`?mode=ro&immutable=1`) without ever writing to Goldfish files or modifying Goldfish Desktop.
+- **Router Isolation & Loop-of-Doom Prevention**: Laya inspects only the stripped latest user message (`state={"message": sanitized}`), ignoring `role != "user"`, blockquotes, fenced codeblocks, and `[SHARED PLANE]` / `[SHARED PLANE REPORT]` markers, while deduplicating every message ID in SQLite.
+- **Safety-First Dispatch (`propose_first` default)**: Natural build requests stage `PENDING_APPROVAL` proposals in `.openrig-bridge/tasks.sqlite` for one-click approval in Companion Inbox (`/inbox`). Passing `--auto-approve-sandbox` (or `dispatch.mode: auto_dispatch_sandbox` in `plane.yaml`) auto-approves **only** when the target repository is an allowlisted `.disposable-live-repo` on `integration`—never `main` and never `git push`.
+- **Independent Review & Clean Integration**: Enforces $Reviewer \ne Implementer$ (for `codex-1` builds, skips the redundant planner turn and routes directly `codex-1` → read-only `antigravity-1` → `worktree-gate.sh`), auto-commits clean implementer changes excluding `.openrig-*-seat.log`, and records changed files + `_integration` path in `latest_report.md`.
+
+---
+
+## ✅ Verified Live Proof, Scope (`v1.0.0`) & `v1.1` Roadmap
+
+### Verified Capabilities in `v1.0.0`
+- **Text-Based `Observed UI` Multi-Turn Handoff**: Carries up to 6 turns (`recent_context`) from Goldfish chat into `SpecBuilder` while isolating Laya intent classification.
+- **End-to-End Multi-Agent Builds (`DONE`)**: Live builds on `.disposable-live-repo` verified across both approval-gated `/inbox` dispatch and hands-free `--auto-approve-sandbox` (`codex-1` implementer + read-only `antigravity-1` / `opencode-1` reviewer → deterministic `worktree-gate.sh` merge into `integration`).
+- **Cross-Platform Windows ↔ WSL Execution**: Threaded loopback HTTP server (`ThreadingHTTPServer` with idle-socket timeout), threaded non-blocking `SeatBridgeProcess` / `codex_seat_runner.py` readers, Windows→WSL path translation (`to_wsl_path`), bidirectional relative worktree `gitdir` normalization, and accurate `failed_stage` reporting.
+- **Offline Regression Suite**: 115 offline tests across 14 modules + `python -m plane.daemon doctor` (8/8 `[PASS]`).
+
+### `v1.1` Roadmap
+- Direct UI snapshot `--image` forwarding from Goldfish captures to Codex (`codex exec -i`).
+- Interactive repository picker in the Companion Inbox (`/inbox`) UI.
+- Greenfield repository scaffolding workflow for new projects outside `.disposable-live-repo`.
+- Chat-driven dispatch mode & model selection toggles (`@rig mode ...`, per-role model overrides).
 
 ---
 
@@ -184,7 +207,7 @@ Boss_Rig/
 │   ├── store.py                        # Durable SQLite task, cursor & event store (tasks.sqlite)
 │   ├── task_service.py                 # Core bridge task coordinator & worker thread manager
 │   ├── chat_watcher.py                 # Goldfish transcript file watcher & spec hash validator
-│   ├── server.py                       # Authenticated REST API daemon (localhost:7440)
+│   ├── server.py                       # Authenticated REST API daemon (localhost:8383)
 │   ├── mcp_server.py                   # Model Context Protocol (MCP) server for Boss Rig tools
 │   ├── bridge_cli.py                   # Unified CLI for watcher, server, and task management
 │   ├── event_emitter.py                # OS notifications & out-of-band JSON event logging
@@ -220,7 +243,7 @@ Boss_Rig/
 ### 1. Architectural Overview & Context
 Goldfish Desktop provides persistent contextual memory and chat capabilities, but (as of v0.1.63) does not support outbound shell execution, custom chat-tool registration, or direct orchestrator dispatch.
 
-To enable Jacob to develop specifications inside Goldfish and have Boss Rig execute them autonomously without manual copy-paste, Boss Rig provides a **durable, filesystem-based execution bridge**:
+To enable operators to develop specifications inside Goldfish and have Boss Rig execute them autonomously without manual copy-paste, Boss Rig provides a **durable, filesystem-based execution bridge**:
 
 ```mermaid
 flowchart TD
@@ -283,7 +306,7 @@ The specification block is formatted inside a fenced `boss-rig-spec` markdown co
     "No network calls in generated application code or verification tests"
   ],
   "goal": "Implement say_hello() function in hello.py returning 'hello'",
-  "repo": "C:/Users/jacob/Boss Agent/.disposable-live-repo",
+  "repo": "<REPO_ROOT>/.disposable-live-repo",
   "spec_version": 1,
   "timeout_sec": 600,
   "verification_commands": [
@@ -364,8 +387,8 @@ python -m orchestrator.bridge_cli questions
 
 #### B. Authenticated REST API (`orchestrator/server.py`)
 ```bash
-# Start REST server on default localhost:7440
-python -m orchestrator.bridge_cli serve --port 7440
+# Start REST server & Companion Inbox UI on localhost:8383
+python -m orchestrator.bridge_cli serve --port 8383
 ```
 - **Authentication**: Requires `Authorization: Bearer <token>` (stored at `.openrig-bridge/auth.token`).
 - **Endpoints**:
@@ -444,15 +467,15 @@ rig up ./rig.yaml --yes
 
 ### 3. Run the Verification Test Suite
 
-Run the full unified test suite across all 6 test modules:
+Run the 14 offline test modules (`test_shared_plane`, `test_windows_dispatcher`, `test_codex_bridge`, `test_antigravity_completion_semantics`, `test_antigravity_stream_protocol`, `test_scheduler_and_policy`, `test_store_and_idempotency`, `test_operator_intervention`, `test_goldfish_context_priming`, `test_fault_injection`, `test_mcp_server`, `test_server_api`, `test_bridge_e2e`, `test_conversational_bridge_e2e`):
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py' -v
+python -m unittest tests.test_shared_plane tests.test_windows_dispatcher tests.test_codex_bridge tests.test_antigravity_completion_semantics tests.test_antigravity_stream_protocol tests.test_scheduler_and_policy tests.test_store_and_idempotency tests.test_operator_intervention tests.test_goldfish_context_priming tests.test_fault_injection tests.test_mcp_server tests.test_server_api tests.test_bridge_e2e tests.test_conversational_bridge_e2e -v
 ```
 
 **Expected Output:**
 ```text
-Ran 32 tests in 290.765s
+Ran 115 tests in ~46s
 
 OK
 ```
