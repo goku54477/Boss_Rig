@@ -65,12 +65,16 @@ set_state() {
 normalize_worktree_gitdir() {
   local wt="$1"
   local seat="$2"
-  if [[ -f "$wt/.git" ]]; then
-    rm -f "$wt/.git"
-    printf 'gitdir: ../../.git/worktrees/%s\n' "$seat" > "$wt/.git"
+  local expected_git="gitdir: ../../.git/worktrees/$seat"
+  local expected_meta="../../../.worktrees/$seat/.git"
+  if [[ -f "$wt/.git" ]] && [[ "$(<"$wt/.git")" != "$expected_git" ]]; then
+    printf '%s\n' "$expected_git" > "$wt/.git.$$"
+    mv -f "$wt/.git.$$" "$wt/.git"
   fi
-  if [[ -f "$COMMON_GIT_DIR/worktrees/$seat/gitdir" ]]; then
-    printf '../../../.worktrees/%s/.git\n' "$seat" > "$COMMON_GIT_DIR/worktrees/$seat/gitdir"
+  local meta_file="$COMMON_GIT_DIR/worktrees/$seat/gitdir"
+  if [[ -f "$meta_file" ]] && [[ "$(<"$meta_file")" != "$expected_meta" ]]; then
+    printf '%s\n' "$expected_meta" > "$meta_file.$$"
+    mv -f "$meta_file.$$" "$meta_file"
   fi
 }
 
