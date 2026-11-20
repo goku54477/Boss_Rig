@@ -373,6 +373,13 @@ case "$cmd" in
 
     set_state "$task" MERGE_READY
 
+    acquire_lock || {
+      set_state "$task" REVIEW
+      exit 75
+    }
+
+    trap release_lock EXIT INT TERM HUP
+
     int_wt="$(branch_worktree "$INTEGRATION_BRANCH")" || {
       echo "integration branch must be checked out in a non-agent worktree" >&2
       set_state "$task" REVIEW_FAILED
@@ -383,13 +390,6 @@ case "$cmd" in
       set_state "$task" REVIEW_FAILED
       exit 2
     }
-
-    acquire_lock || {
-      set_state "$task" REVIEW
-      exit 75
-    }
-
-    trap release_lock EXIT INT TERM HUP
 
     # Re-check integration after locking
     if ! git -C "$wt" merge --no-edit "$INTEGRATION_BRANCH"; then
