@@ -14,9 +14,9 @@ It turns natural requests in **Goldfish Desktop** (or any JSONL-emitting brain) 
 
 ## 🎬 Demo
 
-https://github.com/goku54477/Boss_Rig/raw/main/docs/assets/boss-rig-demo.mp4
+https://github.com/user-attachments/assets/a582fb2a-bd13-4e4d-8c80-56b8a9e135ae
 
-> **▶ [Watch or download `boss-rig-demo.mp4`](docs/assets/boss-rig-demo.mp4)**
+[Download the demo](https://github.com/goku54477/Boss_Rig/raw/main/docs/assets/boss-rig-demo.mp4)
 
 *How it works:* We use **Goldfish** to capture live project context and natural build requests, pass them through **Boss Rig's Shared Plane** (`Laya` intent routing → HMAC approval → isolated `codex-1` / `antigravity-1` / `opencode-1` worktrees → `worktree-gate.sh`), and deliver verified build results and `_integration` paths right back into the original conversation flow via `/reports/latest`, Companion Inbox, and desktop notifications.
 
