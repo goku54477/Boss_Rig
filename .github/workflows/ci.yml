@@ -30,7 +30,6 @@ jobs:
           git config --global user.email "ci@boss-rig.local"
           git checkout -B main
           git branch -f integration HEAD
-          git branch --set-upstream-to=origin/integration integration 2>/dev/null || true
 
       - name: Run Core Test Suite
         run: |
