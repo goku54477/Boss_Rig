@@ -7,7 +7,7 @@ import os
 import secrets
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
@@ -52,6 +52,7 @@ def get_or_create_auth_token(token_path: Optional[Path] = None) -> str:
 class TaskServiceHandler(BaseHTTPRequestHandler):
     """HTTP Request Handler mapping REST endpoints to TaskService methods."""
 
+    timeout = 10
     service: TaskService
     auth_token: str
     reports_dir: Path
@@ -577,6 +578,14 @@ setInterval(refreshAll, 3000);
 
 
 
+class _BossRigHTTPServer(ThreadingHTTPServer):
+    """Threaded loopback HTTP server that does not block on idle sockets or steal Windows ports."""
+
+    daemon_threads = True
+    block_on_close = False
+    allow_reuse_address = os.name != "nt"
+
+
 class TaskServer:
     """Manages the background HTTP server lifecycle."""
 
@@ -607,18 +616,29 @@ class TaskServer:
                 "reports_dir": self.reports_dir,
             },
         )
-        self.httpd = HTTPServer((self.host, self.port), handler_class)
+        self.httpd = _BossRigHTTPServer((self.host, self.port), handler_class)
         self.port = self.httpd.server_port
         self.thread: Optional[threading.Thread] = None
+        self._stopped = False
 
     def start(self) -> None:
         """Start server in background thread."""
+        self._stopped = False
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True, name="task-server")
         self.thread.start()
 
     def stop(self) -> None:
         """Stop server and wait for thread to join."""
-        self.httpd.shutdown()
-        self.httpd.server_close()
+        if self._stopped:
+            return
+        self._stopped = True
+        try:
+            self.httpd.shutdown()
+        except Exception:
+            pass
+        try:
+            self.httpd.server_close()
+        except Exception:
+            pass
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=3.0)
+            self.thread.join(timeout=2.0)

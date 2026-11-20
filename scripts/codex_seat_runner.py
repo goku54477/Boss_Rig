@@ -103,11 +103,24 @@ def run_codex_task(
         extra_data={"cwd": cwd, "model": model or "default"},
     )
 
+    role_instruction = ""
+    if role == "reviewer":
+        role_instruction = (
+            "ROLE CONSTRAINT (reviewer): You are performing a READ-ONLY code review of the candidate commit. "
+            "Do NOT create, edit, or delete any files in this worktree. Reply concisely with your review verdict.\n\n"
+        )
+    elif role == "planner":
+        role_instruction = (
+            "ROLE CONSTRAINT (planner): Produce a concise implementation plan only in READ-ONLY mode. "
+            "Do NOT create, edit, or delete any files in this worktree.\n\n"
+        )
+
     prompt = (
         f"You are an interchangeable OpenRig seat ({SEAT_ID}).\n"
         f"Your role for THIS task is '{role}'. It is NOT your permanent identity.\n"
         f"Stay inside the current worktree ({cwd}).\n"
         f"Do NOT touch files outside this repository worktree.\n\n"
+        f"{role_instruction}"
         f"Goal: {goal}\n\n"
         f"TASK_ENVELOPE={raw_envelope}"
     )

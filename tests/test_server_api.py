@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
 import tempfile
 import time
 import unittest
@@ -141,6 +142,59 @@ class TestTaskServerAPI(unittest.TestCase):
         status = self._request("GET", f"/tasks/{stored_tid}")
         self.assertEqual(status["task_id"], stored_tid)
         self.assertEqual(status["spec_id"], spec_hash)
+
+    def test_idle_tcp_client_does_not_block_concurrent_requests_or_shutdown_and_immediate_restart(
+        self,
+    ) -> None:
+        """Idle/preconnect TCP socket must not wedge /health, /proposals, /tasks, or server.stop()."""
+        bound_port = self.server.port
+        idle_sock = socket.create_connection(("127.0.0.1", bound_port), timeout=2.0)
+        try:
+            # Give the server accept loop a moment to accept the silent socket
+            time.sleep(0.05)
+
+            for path, needs_auth in (("/health", False), ("/proposals", True), ("/tasks", True)):
+                req = urllib.request.Request(f"{self.base_url}{path}", method="GET")
+                if needs_auth:
+                    req.add_header("Authorization", f"Bearer {self.server.auth_token}")
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+                    self.assertIsInstance(payload, dict)
+
+            # Duplicate server on the same active port must be rejected (no silent port stealing)
+            with self.assertRaises(OSError):
+                TaskServer(
+                    service=self.service,
+                    host="127.0.0.1",
+                    port=bound_port,
+                    token_path=self.token_file,
+                )
+
+            # Stopping the server while the idle socket is still open must complete within 2s
+            t0 = time.monotonic()
+            self.server.stop()
+            stop_elapsed = time.monotonic() - t0
+            self.assertLess(stop_elapsed, 2.0)
+        finally:
+            try:
+                idle_sock.close()
+            except Exception:
+                pass
+
+        # Immediate restart on the same port must succeed without WinError 10048
+        restarted = TaskServer(
+            service=self.service,
+            host="127.0.0.1",
+            port=bound_port,
+            token_path=self.token_file,
+        )
+        restarted.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{bound_port}/health", timeout=1.5) as r:
+                self.assertEqual(r.status, 200)
+        finally:
+            restarted.stop()
 
 
 if __name__ == "__main__":
