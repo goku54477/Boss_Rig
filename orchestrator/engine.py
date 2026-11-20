@@ -2,28 +2,39 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from orchestrator.dispatcher import SeatHoldError, TaskDispatcher
 from orchestrator.goldfish import GoldfishPrimer
 from orchestrator.models import SeatMode, TaskEnvelope, TaskRecord, TaskState
 from orchestrator.policy import PolicyEngine, PolicyViolation
+from orchestrator.security import to_wsl_path
 from orchestrator.store import TaskStore
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GATE_SCRIPT = REPO_ROOT / "scripts" / "worktree-gate.sh"
 WORKTREES_DIR = REPO_ROOT / ".worktrees"
+_WIN_PATH_ARG_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 def run_gate(*args: str, repo: Optional[Path] = None) -> subprocess.CompletedProcess[str]:
     target = repo or REPO_ROOT
-    cmd = ["bash", str(GATE_SCRIPT), *args]
+    script_arg = to_wsl_path(GATE_SCRIPT) if sys.platform == "win32" else str(GATE_SCRIPT)
+    converted_args = [
+        to_wsl_path(a) if (sys.platform == "win32" and _WIN_PATH_ARG_RE.match(a)) else a
+        for a in args
+    ]
+    cmd = ["bash", script_arg, *converted_args]
     return subprocess.run(
         cmd,
         cwd=str(target),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 
@@ -73,7 +84,9 @@ class OrchestrationEngine:
             task_id=task_id,
             state=TaskState.QUEUED,
             goal=goal,
-            verification_commands=verification_commands or ["true"],
+            verification_commands=(
+                list(verification_commands) if verification_commands is not None else ["true"]
+            ),
             context=context,
         )
         record.transition(TaskState.QUEUED, reason="Task created")
@@ -99,6 +112,85 @@ class OrchestrationEngine:
         task.transition(TaskState.ASSIGNED, reason=f"Assigned {engine} as {role}")
         self.store.save_task(task)
         return task
+
+    def _auto_commit_implementer_worktree(self, seat_wt: Path, task_id: str) -> None:
+        """Remove seat logs and commit implementer changes so review sees a clean candidate commit."""
+        if not (seat_wt / ".git").exists():
+            return
+
+        for log_file in seat_wt.glob(".openrig-*-seat.log"):
+            if log_file.is_file():
+                try:
+                    log_file.unlink()
+                except OSError:
+                    pass
+
+        status_res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=seat_wt,
+            capture_output=True,
+            text=True,
+        )
+        if status_res.returncode != 0 or not status_res.stdout.strip():
+            return
+
+        add_res = subprocess.run(
+            ["git", "add", "-A"],
+            cwd=seat_wt,
+            capture_output=True,
+            text=True,
+        )
+        if add_res.returncode != 0:
+            raise RuntimeError(
+                f"Failed to stage implementer changes in '{seat_wt}': {add_res.stderr.strip()}"
+            )
+
+        remaining_logs = [p.name for p in seat_wt.glob(".openrig-*-seat.log") if p.is_file()]
+        if remaining_logs:
+            subprocess.run(
+                ["git", "reset", "-q", "HEAD", "--", *remaining_logs],
+                cwd=seat_wt,
+                capture_output=True,
+                text=True,
+            )
+
+        diff_res = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=seat_wt,
+            capture_output=True,
+            text=True,
+        )
+        if diff_res.returncode == 0:
+            return
+
+        identity_args: List[str] = []
+        for cfg_key in ("user.name", "user.email"):
+            cfg_res = subprocess.run(
+                ["git", "config", "--get", cfg_key],
+                cwd=seat_wt,
+                capture_output=True,
+                text=True,
+            )
+            if cfg_res.returncode != 0 or not cfg_res.stdout.strip():
+                identity_args = [
+                    "-c",
+                    "user.name=OpenRig Seat",
+                    "-c",
+                    "user.email=openrig@local",
+                ]
+                break
+
+        commit_res = subprocess.run(
+            ["git", *identity_args, "commit", "-m", f"feat(boss-rig): implementer changes for {task_id}"],
+            cwd=seat_wt,
+            capture_output=True,
+            text=True,
+        )
+        if commit_res.returncode != 0:
+            raise RuntimeError(
+                f"Failed to auto-commit implementer changes in '{seat_wt}': "
+                f"stdout={commit_res.stdout.strip()} stderr={commit_res.stderr.strip()}"
+            )
 
     def execute_turn(
         self,
@@ -130,10 +222,20 @@ class OrchestrationEngine:
                 f"Seat '{engine}' is on MANUAL_HOLD: {reason}. Automated turn rejected."
             )
 
-        # Ensure seat worktree is initialized
+        # Ensure seat worktree is a valid Git worktree; fail fast instead of leaving an empty dir
         seat_wt = self.worktrees_dir / engine
         if not seat_wt.exists():
-            self.run_gate("init-seat", engine)
+            init_res = self.run_gate("init-seat", engine)
+            if init_res.returncode != 0 or not (seat_wt / ".git").exists():
+                raise RuntimeError(
+                    f"worktree-gate init-seat failed for '{engine}' (rc={init_res.returncode}): "
+                    f"stdout={init_res.stdout.strip()} stderr={init_res.stderr.strip()}"
+                )
+        elif not (seat_wt / ".git").exists():
+            raise RuntimeError(
+                f"Seat worktree '{seat_wt}' exists without a valid .git worktree marker; "
+                f"remove the empty directory and re-run init-seat."
+            )
 
         # Bind seat to task branch for implementer role requiring writable branch mutations
         if role == "implementer":
@@ -160,15 +262,18 @@ class OrchestrationEngine:
         status = event.get("status", "ERROR")
 
         if status == "SUCCESS":
-            # Record current candidate commit from worktree
-            rev_res = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=seat_wt,
-                capture_output=True,
-                text=True,
-            )
-            if rev_res.returncode == 0:
-                task.candidate_commit = rev_res.stdout.strip()
+            # Record current candidate commit from worktree ONLY for implementer role!
+            # Reviewers or planners must never overwrite the candidate commit.
+            if role == "implementer":
+                self._auto_commit_implementer_worktree(seat_wt, task_id)
+                rev_res = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=seat_wt,
+                    capture_output=True,
+                    text=True,
+                )
+                if rev_res.returncode == 0:
+                    task.candidate_commit = rev_res.stdout.strip()
 
             # Invariant: Agent completion NEVER transitions directly to DONE!
             # It only transitions to REVIEW!
@@ -178,9 +283,10 @@ class OrchestrationEngine:
                 candidate_commit=task.candidate_commit,
             )
         else:
+            fail_state = TaskState.REVIEW_FAILED if role == "reviewer" else TaskState.FAILED
             task.transition(
-                TaskState.REVIEW_FAILED,
-                reason=f"Agent turn failed with status {status}",
+                fail_state,
+                reason=f"Agent turn failed at role '{role}' with status {status}",
                 error=event.get("error", "Execution failure"),
             )
 
@@ -195,17 +301,22 @@ class OrchestrationEngine:
     ) -> bool:
         """Run the deterministic verification supervisor and merge to integration."""
         task = self.tasks[task_id]
-        seat = seat_id or task.assigned_engine or "opencode-1"
+        # Invariant: verification must evaluate the implementer seat worktree, never the reviewer seat
+        seat = seat_id or task.implementer or task.assigned_engine or "opencode-1"
+
 
         PolicyEngine.assert_commit_pinned(task)
         PolicyEngine.assert_valid_state_transition(task.state, TaskState.MERGE_READY)
         task.transition(TaskState.MERGE_READY, reason="Ready for verification gate")
 
         # Run verification command via worktree-gate.sh review
-        verify_cmd = " && ".join(task.verification_commands)
+        verify_cmd = " && ".join(cmd for cmd in task.verification_commands if str(cmd).strip())
         task.transition(TaskState.MERGING, reason="Acquiring merge lock and running verification gate")
 
-        gate_res = self.run_gate("review", task_id, seat, verify_cmd)
+        gate_args = ["review", task_id, seat]
+        if verify_cmd:
+            gate_args.append(verify_cmd)
+        gate_res = self.run_gate(*gate_args)
         if gate_res.returncode == 0:
             # Capture merge commit
             int_rev = subprocess.run(

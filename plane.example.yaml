@@ -1,0 +1,47 @@
+# Boss Rig Shared Plane v1 Configuration Template
+# Copy to plane.yaml and customize for your environment.
+
+router:
+  # "laya" uses Laya System-1 (text-only, vega=False) with automatic HeuristicRouter fallback.
+  # Set to "heuristic" for zero-dependency prefix/phrase matching with no model checkpoint download.
+  mode: laya
+  threshold: 0.75
+  prefix_triggers:
+    - "@rig"
+    - "@boss-rig"
+    - "build a"
+    - "create a"
+    - "implement"
+
+dispatch:
+  # Default "propose_first" creates PENDING_APPROVAL proposals for one-click /inbox approval.
+  # Optional "auto_dispatch_sandbox" auto-dispatches ONLY when targeting an allowlisted
+  # ".disposable-live-repo" sandbox repository on the "integration" branch.
+  mode: propose_first
+  default_repo: ".disposable-live-repo"
+  sandbox_repos:
+    - ".disposable-live-repo"
+  allowed_merge_target: "integration"
+  # Empty [] lets worktree-gate.sh auto-detect project test suites (package.json, pyproject.toml)
+  # or pass cleanly on static HTML/CSS/JS builds.
+  verification_commands: []
+  poll_interval_sec: 0.5
+
+agents:
+  enabled:
+    - "opencode-1"
+    - "codex-1"
+    - "antigravity-1"
+  default_planner: "antigravity-1"
+  default_implementer: "opencode-1"
+
+listeners:
+  # Leave goldfish_chats_dir null to auto-resolve %APPDATA%/goldfish/chats (strictly read-only).
+  goldfish_chats_dir: null
+  enable_jsonl_bus: true
+  # Leave jsonl_bus_path null to default to ~/.boss-rig/bus.jsonl.
+  jsonl_bus_path: null
+
+speaker:
+  reports_dir: ".openrig-bridge/reports"
+  enable_toasts: true

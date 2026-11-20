@@ -2,7 +2,7 @@
 
 **Status:** `PASSED`
 **Audit Date:** 2026-10-14
-**Repository Root:** `/mnt/c/Users/jacob/Boss Agent`
+**Repository Root:** `<REPO_ROOT>`
 
 ---
 

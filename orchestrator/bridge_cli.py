@@ -31,6 +31,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     service = TaskService(dry_run=args.dry_run)
     server = TaskServer(service=service, host=args.host, port=args.port)
     print(f"[START] Starting Boss Rig Task Server on http://{args.host}:{server.port}")
+    print(f"[INBOX] Operator Companion Inbox UI: http://{args.host}:{server.port}/inbox")
     print(f"[AUTH] Bearer Token: {server.auth_token}")
     print("Press Ctrl+C to terminate.")
     server.start()
@@ -114,12 +115,44 @@ def cmd_questions(args: argparse.Namespace) -> int:
 def cmd_answer(args: argparse.Namespace) -> int:
     service = TaskService()
     try:
-        res = service.task_answer(args.question_id, args.answer)
+        res = service.task_answer(
+            args.question_id,
+            args.answer,
+            task_id=args.task_id,
+            conversation_id=args.conversation_id,
+        )
         print(f"✓ Answer recorded for {args.question_id}: status={res.get('status')}")
         return 0
     except Exception as exc:
         print(f"❌ Error: {exc}")
         return 1
+
+
+def cmd_proposals(args: argparse.Namespace) -> int:
+    service = TaskService()
+    props = service.list_proposals(status=args.status, repo=args.repo, limit=args.limit)
+    if not props:
+        print("No proposals found.")
+        return 0
+    print(f"{'PROPOSAL ID':<18} {'STATUS':<12} {'REPO':<30} GOAL")
+    print("-" * 80)
+    for p in props:
+        print(f"{p['proposal_id']:<18} {p['status']:<12} {p.get('repo','')[:28]:<30} {p.get('goal','')[:30]}")
+    return 0
+
+
+def cmd_events(args: argparse.Namespace) -> int:
+    service = TaskService()
+    events = service.get_task_outbox_events(args.task_id, after_seq=args.after_seq, limit=args.limit)
+    if not events:
+        print(f"No events found for task {args.task_id}.")
+        return 0
+    print(f"{'SEQ':<6} {'EVENT TYPE':<26} {'TIMESTAMP':<22} PAYLOAD")
+    print("-" * 85)
+    for ev in events:
+        payload_str = json.dumps(ev.get("payload", {}))
+        print(f"{ev.get('seq', 0):<6} {ev.get('event_type',''):<26} {ev.get('timestamp','')[:19]:<22} {payload_str[:40]}")
+    return 0
 
 
 def cmd_token(args: argparse.Namespace) -> int:
@@ -168,6 +201,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_tasks.add_argument("--limit", type=int, default=50, help="Max tasks to show")
     p_tasks.add_argument("--state", help="Filter by state")
 
+    # proposals
+    p_prop = subparsers.add_parser("proposals", help="List pending or historical task proposals")
+    p_prop.add_argument("--limit", type=int, default=50, help="Max proposals to show")
+    p_prop.add_argument("--status", help="Filter by status (e.g. PROPOSED, APPROVED, REJECTED)")
+    p_prop.add_argument("--repo", help="Filter by repo path")
+
+    # events
+    p_ev = subparsers.add_parser("events", help="List ordered timeline outbox events for a task")
+    p_ev.add_argument("task_id", help="Task ID")
+    p_ev.add_argument("--after-seq", type=int, default=0, help="Only return events after this seq number")
+    p_ev.add_argument("--limit", type=int, default=100, help="Max events to show")
+
     # questions
     p_q = subparsers.add_parser("questions", help="List questions")
     p_q.add_argument("--task-id", help="Filter by task ID")
@@ -183,6 +228,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_ans = subparsers.add_parser("answer", help="Answer a pending question")
     p_ans.add_argument("question_id", help="Question ID to answer")
     p_ans.add_argument("answer", help="Answer text")
+    p_ans.add_argument("--task-id", help="Binding Task ID to prevent cross-task hijacking")
+    p_ans.add_argument("--conversation-id", help="Binding Conversation ID to prevent cross-conversation hijacking")
 
     # token
     subparsers.add_parser("token", help="Show local bearer auth token")
@@ -194,6 +241,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_watch(args)
     elif args.subcommand == "tasks":
         return cmd_tasks(args)
+    elif args.subcommand == "proposals":
+        return cmd_proposals(args)
+    elif args.subcommand == "events":
+        return cmd_events(args)
     elif args.subcommand == "questions":
         return cmd_questions(args)
     elif args.subcommand == "ask-question":

@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
+import queue
+import signal
 import subprocess
 import sys
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 SEAT_ID = os.environ.get("OPENRIG_SEAT_ID", "codex-1")
 NOTIFY_SEAT = os.environ.get("OPENRIG_NOTIFY_SEAT", "")
@@ -99,11 +103,24 @@ def run_codex_task(
         extra_data={"cwd": cwd, "model": model or "default"},
     )
 
+    role_instruction = ""
+    if role == "reviewer":
+        role_instruction = (
+            "ROLE CONSTRAINT (reviewer): You are performing a READ-ONLY code review of the candidate commit. "
+            "Do NOT create, edit, or delete any files in this worktree. Reply concisely with your review verdict.\n\n"
+        )
+    elif role == "planner":
+        role_instruction = (
+            "ROLE CONSTRAINT (planner): Produce a concise implementation plan only in READ-ONLY mode. "
+            "Do NOT create, edit, or delete any files in this worktree.\n\n"
+        )
+
     prompt = (
         f"You are an interchangeable OpenRig seat ({SEAT_ID}).\n"
         f"Your role for THIS task is '{role}'. It is NOT your permanent identity.\n"
         f"Stay inside the current worktree ({cwd}).\n"
         f"Do NOT touch files outside this repository worktree.\n\n"
+        f"{role_instruction}"
         f"Goal: {goal}\n\n"
         f"TASK_ENVELOPE={raw_envelope}"
     )
@@ -111,25 +128,76 @@ def run_codex_task(
     cmd = build_codex_command(prompt, cwd, model=model)
 
     last_agent_message = ""
-    with open(LOG_PATH, "a", encoding="utf-8") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,  # Prevent hanging on stdin
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+    stderr_tail: Deque[str] = deque(maxlen=50)
+    stdout_queue: queue.Queue[Optional[str]] = queue.Queue()
 
-        deadline = time.time() + timeout_sec
-        timed_out = False
+    def _pump_stdout(pipe: Any) -> None:
+        try:
+            for raw_line in iter(pipe.readline, ""):
+                stdout_queue.put(raw_line)
+        except Exception:
+            pass
+        finally:
+            stdout_queue.put(None)
+
+    def _drain_stderr(pipe: Any) -> None:
+        try:
+            for raw_line in iter(pipe.readline, ""):
+                stripped = raw_line.rstrip("\r\n")
+                if stripped:
+                    stderr_tail.append(stripped)
+        except Exception:
+            pass
+
+    def _terminate_proc_tree(proc: subprocess.Popen[str]) -> None:
+        if proc.poll() is not None:
+            return
+        if hasattr(os, "killpg"):
+            for sig, wait_sec in ((signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+                try:
+                    os.killpg(os.getpgid(proc.pid), sig)
+                    proc.wait(timeout=wait_sec)
+                    return
+                except Exception:
+                    pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    with open(LOG_PATH, "a", encoding="utf-8") as log_file:
+        popen_kwargs: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,  # Prevent hanging on stdin
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        stdout_thread = threading.Thread(target=_pump_stdout, args=(proc.stdout,), daemon=True)
+        stderr_thread = threading.Thread(target=_drain_stderr, args=(proc.stderr,), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
 
         start_t = time.time()
+        deadline = start_t + timeout_sec
+        timed_out = False
+        eof_seen = False
         last_hb = start_t
-        # Read streaming json lines from codex exec
-        assert proc.stdout is not None
-        while True:
-            line = proc.stdout.readline()
+
+        while not eof_seen:
             now = time.time()
             if now - last_hb >= 5.0:
                 last_hb = now
@@ -142,14 +210,21 @@ def run_codex_task(
                     extra_data={"elapsed_sec": int(now - start_t)},
                 )
 
-            if not line:
-                if proc.poll() is not None:
+            remaining = deadline - now
+            if remaining <= 0:
+                timed_out = True
+                break
+
+            try:
+                line = stdout_queue.get(timeout=min(remaining, 0.25))
+            except queue.Empty:
+                if proc.poll() is not None and stdout_queue.empty():
                     break
-                if time.time() > deadline:
-                    timed_out = True
-                    break
-                time.sleep(0.05)
                 continue
+
+            if line is None:
+                eof_seen = True
+                break
 
             log_file.write(line)
             log_file.flush()
@@ -167,15 +242,17 @@ def run_codex_task(
                     pass
 
         if timed_out:
-            try:
-                os.killpg(os.getpgid(proc.pid), 15)
-                proc.wait(timeout=3)
-            except Exception:
+            _terminate_proc_tree(proc)
+            for pipe in (proc.stdout, proc.stderr):
                 try:
-                    os.killpg(os.getpgid(proc.pid), 9)
-                    proc.wait(timeout=2)
+                    pipe.close()
                 except Exception:
                     pass
+            stdout_thread.join(timeout=1.0)
+            stderr_thread.join(timeout=1.0)
+            if stderr_tail:
+                log_file.write("\n[stderr tail on timeout]\n" + "\n".join(stderr_tail) + "\n")
+                log_file.flush()
             emit_bridge_event(
                 "task_timeout",
                 task_id,
@@ -188,6 +265,11 @@ def run_codex_task(
             return
 
         exit_code = proc.wait()
+        stdout_thread.join(timeout=1.0)
+        stderr_thread.join(timeout=1.0)
+        if exit_code != 0 and stderr_tail:
+            log_file.write("\n[stderr tail]\n" + "\n".join(stderr_tail) + "\n")
+            log_file.flush()
 
     if exit_code == 0:
         # Agent turn completed. NOTE: Does NOT mean software task is DONE.

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import os
-import select
+import queue
 import subprocess
+import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 from orchestrator.models import BridgeEvent, SeatMode, TaskEnvelope
+from orchestrator.security import kill_process_tree, to_wsl_path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKTREES_DIR = REPO_ROOT / ".worktrees"
@@ -20,29 +23,72 @@ class SeatHoldError(RuntimeError):
     pass
 
 
-
 class SeatBridgeProcess:
-    """Manages an active bridge process for a seat."""
+    """Manages an active bridge process for a seat using cross-platform threaded pipe reading."""
 
-    def __init__(self, seat_id: str, script_name: str, cwd: Path):
+    def __init__(
+        self,
+        seat_id: str,
+        script_name: str,
+        cwd: Path,
+        command: Optional[List[str]] = None,
+    ):
         self.seat_id = seat_id
         self.cwd = cwd
         self.script_path = REPO_ROOT / "scripts" / script_name
         env = os.environ.copy()
         env["OPENRIG_SEAT_ID"] = seat_id
+        cmd = list(command) if command is not None else ["bash", to_wsl_path(self.script_path)]
         self.proc = subprocess.Popen(
-            ["bash", str(self.script_path)],
+            cmd,
             cwd=str(self.cwd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             env=env,
         )
         assert self.proc.stdout is not None
-        os.set_blocking(self.proc.stdout.fileno(), False)
-        self.line_buffer = ""
+        self._line_queue: queue.Queue[Optional[str]] = queue.Queue()
+        self._stderr_tail: Deque[str] = deque(maxlen=50)
+        self._eof = False
+        self._stdout_thread = threading.Thread(
+            target=self._read_stdout_loop, daemon=True, name=f"bridge-out-{seat_id}"
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._read_stderr_loop, daemon=True, name=f"bridge-err-{seat_id}"
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _read_stdout_loop(self) -> None:
+        stdout = self.proc.stdout
+        try:
+            if stdout is not None:
+                for raw_line in iter(stdout.readline, ""):
+                    self._line_queue.put(raw_line.rstrip("\r\n"))
+        except Exception:
+            pass
+        finally:
+            self._line_queue.put(None)
+
+    def _read_stderr_loop(self) -> None:
+        stderr = self.proc.stderr
+        try:
+            if stderr is not None:
+                for raw_line in iter(stderr.readline, ""):
+                    stripped = raw_line.rstrip("\r\n")
+                    if stripped:
+                        self._stderr_tail.append(stripped)
+        except Exception:
+            pass
+
+    @property
+    def stderr_summary(self) -> str:
+        return "\n".join(self._stderr_tail)
 
     def send_line(self, line: str) -> None:
         assert self.proc.stdin is not None
@@ -50,42 +96,28 @@ class SeatBridgeProcess:
         self.proc.stdin.flush()
 
     def read_event(self, timeout_sec: float = 60.0) -> Optional[Dict[str, Any]]:
-        assert self.proc.stdout is not None
+        if self._eof and self._line_queue.empty():
+            return None
         deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            while "\n" in self.line_buffer:
-                line, self.line_buffer = self.line_buffer.split("\n", 1)
-                line = line.strip()
-                if line.startswith("BRIDGE_EVENT "):
-                    try:
-                        return json.loads(line[len("BRIDGE_EVENT ") :])
-                    except json.JSONDecodeError:
-                        continue
-
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
             try:
-                chunk = self.proc.stdout.read()
-            except (BlockingIOError, TypeError):
-                chunk = None
-
-            if chunk:
-                self.line_buffer += chunk
+                line = self._line_queue.get(timeout=min(remaining, 0.25))
+            except queue.Empty:
+                if self._eof or self.proc.poll() is not None and self._line_queue.empty():
+                    return None
                 continue
-
-            if self.proc.poll() is not None:
-                break
-
-            time.sleep(0.02)
-
-        while "\n" in self.line_buffer:
-            line, self.line_buffer = self.line_buffer.split("\n", 1)
-            line = line.strip()
-            if line.startswith("BRIDGE_EVENT "):
+            if line is None:
+                self._eof = True
+                return None
+            stripped = line.strip()
+            if stripped.startswith("BRIDGE_EVENT "):
                 try:
-                    return json.loads(line[len("BRIDGE_EVENT ") :])
+                    return json.loads(stripped[len("BRIDGE_EVENT ") :])
                 except json.JSONDecodeError:
                     continue
-
-        return None
 
     def read_until_event(
         self,
@@ -130,14 +162,24 @@ class SeatBridgeProcess:
     def is_alive(self) -> bool:
         return self.proc.poll() is None
 
-    def close(self) -> None:
+    def close(self, force: bool = False) -> None:
         if self.is_alive():
-            try:
-                self.send_line(":quit")
-                self.proc.wait(timeout=2)
-            except Exception:
-                self.proc.kill()
-                self.proc.wait(timeout=2)
+            terminated = False
+            if not force:
+                try:
+                    self.send_line(":quit")
+                    self.proc.wait(timeout=2)
+                    terminated = True
+                except Exception:
+                    terminated = False
+            if not terminated:
+                kill_process_tree(self.proc.pid)
+                if self.is_alive():
+                    try:
+                        self.proc.kill()
+                        self.proc.wait(timeout=2)
+                    except Exception:
+                        pass
         if self.proc.stdin:
             try:
                 self.proc.stdin.close()
@@ -153,6 +195,9 @@ class SeatBridgeProcess:
                 self.proc.stderr.close()
             except Exception:
                 pass
+        for th in (self._stdout_thread, self._stderr_thread):
+            if th.is_alive():
+                th.join(timeout=1.0)
 
 
 class TaskDispatcher:
@@ -168,8 +213,11 @@ class TaskDispatcher:
             return self.active_bridges[engine]
 
         seat_wt = self.worktrees_dir / engine
-        if not seat_wt.exists():
-            seat_wt.mkdir(parents=True, exist_ok=True)
+        if not seat_wt.exists() or not (seat_wt / ".git").exists():
+            raise RuntimeError(
+                f"Seat worktree '{seat_wt}' is missing or not a valid Git worktree (.git missing). "
+                f"Run worktree-gate.sh init-seat {engine} before dispatching."
+            )
 
         if engine == "opencode-1":
             bridge = SeatBridgeProcess(engine, "opencode-seat-runner.sh", seat_wt)
@@ -182,6 +230,12 @@ class TaskDispatcher:
 
         self.active_bridges[engine] = bridge
         return bridge
+
+    def _evict_bridge(self, engine: str, bridge: SeatBridgeProcess, force: bool = True) -> None:
+        """Close and evict a timed-out or unhealthy seat bridge so no orphan work continues."""
+        if self.active_bridges.get(engine) is bridge:
+            self.active_bridges.pop(engine, None)
+        bridge.close(force=force)
 
     def dispatch_task(
         self,
@@ -217,11 +271,14 @@ class TaskDispatcher:
         # Wait for terminal event: task_result, task_timeout, or task_failed
         term_evt = _read_evt("task_result", float(timeout))
         if not term_evt:
+            self._evict_bridge(engine, bridge, force=True)
             return {
                 "status": "TIMEOUT",
                 "error": f"Task timed out after {timeout} seconds",
                 "exit_code": 124,
             }
+        if term_evt.get("event") == "task_timeout" or term_evt.get("status") == "TIMEOUT":
+            self._evict_bridge(engine, bridge, force=False)
 
         return term_evt
 

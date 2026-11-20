@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -77,11 +78,24 @@ def run_opencode_task(
         extra_data={"cwd": os.getcwd(), "model": model},
     )
 
+    role_instruction = ""
+    if role == "reviewer":
+        role_instruction = (
+            "ROLE CONSTRAINT (reviewer): You are performing a READ-ONLY code review of the candidate commit. "
+            "Do NOT create, edit, or delete any files in this worktree. Reply concisely with your review verdict.\n\n"
+        )
+    elif role == "planner":
+        role_instruction = (
+            "ROLE CONSTRAINT (planner): Produce a concise implementation plan only in READ-ONLY mode. "
+            "Do NOT create, edit, or delete any files in this worktree.\n\n"
+        )
+
     prompt = (
         f"You are an interchangeable OpenRig seat ({SEAT_ID}).\n"
         f"Your role for THIS task is '{role}'. It is NOT your permanent identity.\n"
         f"Stay inside the current worktree ({os.getcwd()}).\n"
         f"Do NOT touch files outside this repository worktree.\n\n"
+        f"{role_instruction}"
         f"Goal: {goal}\n\n"
         f"TASK_ENVELOPE={raw_envelope}"
     )
@@ -100,13 +114,14 @@ def run_opencode_task(
     ]
 
     with open(LOG_PATH, "a", encoding="utf-8") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=log_file,
-            start_new_session=True,
-        )
+        popen_kwargs: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_file,
+            "stderr": log_file,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **popen_kwargs)
 
         start_t = time.time()
         last_hb = start_t
@@ -129,15 +144,26 @@ def run_opencode_task(
                     )
 
         if exit_code is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
-                proc.wait(timeout=3)
-            except Exception:
+            terminated = False
+            if hasattr(os, "killpg"):
+                for sig, wait_sec in ((signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+                    try:
+                        os.killpg(os.getpgid(proc.pid), sig)
+                        proc.wait(timeout=wait_sec)
+                        terminated = True
+                        break
+                    except Exception:
+                        pass
+            if not terminated:
                 try:
-                    os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+                    proc.terminate()
                     proc.wait(timeout=2)
                 except Exception:
-                    pass
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
             emit_bridge_event(
                 "task_timeout",
                 task_id,

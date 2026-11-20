@@ -166,10 +166,23 @@ class AntigravitySession:
             extra_data={"cwd": self.cwd},
         )
 
+        role_instruction = ""
+        if role == "reviewer":
+            role_instruction = (
+                "ROLE CONSTRAINT (reviewer): You are performing a READ-ONLY code review of the candidate commit. "
+                "Do NOT create, edit, or delete any files in this worktree. Reply concisely with your review verdict.\n\n"
+            )
+        elif role == "planner":
+            role_instruction = (
+                "ROLE CONSTRAINT (planner): Produce a concise implementation plan only in READ-ONLY mode. "
+                "Do NOT create, edit, or delete any files in this worktree.\n\n"
+            )
+
         prompt = (
             f"You are an interchangeable OpenRig seat ({SEAT_ID}).\n"
             f"Your temporary role for THIS task is '{role}'.\n"
             f"Stay strictly inside the repository worktree ({self.cwd}).\n\n"
+            f"{role_instruction}"
             f"Goal: {goal}"
         )
 

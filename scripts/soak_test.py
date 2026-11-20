@@ -287,7 +287,7 @@ class SoakTestRunner:
 **Verdict:** `{verdict}`
 **Passed:** `{passed_count} / {total_count}`
 **Execution Time:** {time.strftime('%Y-%m-%d %H:%M:%S')}
-**Environment:** WSL2 Ubuntu 24.04 LTS / OpenRig 0.6.10
+**Environment:** WSL2 Ubuntu 24.04 LTS / OpenRig 0.7.19
 
 ---
 

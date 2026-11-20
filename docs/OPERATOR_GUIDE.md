@@ -202,3 +202,69 @@ If a crash, power outage, or kill signal interrupts a task:
    ./scripts/worktree-gate.sh reset-seat opencode-1
    ```
 This resets the worktree back to its parked branch (`seat/<seat-id>`) and deletes any uncommitted scratch files.
+
+---
+
+## 6. Conversational Bridge & Chat Watcher
+
+Boss Rig features a transport-neutral, approval-gated conversational task bridge that watches Goldfish Desktop transcripts (`%APPDATA%/goldfish/chats/*.json`) and serves external clients via REST and stdio MCP.
+
+### A. Discuss & Propose Scope
+In any conversational interface (Goldfish Desktop or ChatGPT):
+```text
+@boss-rig scope a task to implement user password reset in .disposable-live-repo
+```
+The Chat Watcher or REST endpoint logs a **Task Proposal** (`PENDING_APPROVAL`). Zero agents execute and no Git branches are modified.
+
+### B. Approve & Dispatch
+Review the proposal in the **Companion Inbox UI** (`http://127.0.0.1:8383/inbox`) or reply with the exact SHA-256 spec hash:
+```text
+@boss-rig approve spec_id=sha256:<64-char-hex-hash>
+```
+
+### C. Watcher Execution Modes
+1. **Dry-Run Mode (Default)**:
+   ```bash
+   python -m orchestrator.bridge_cli watch
+   ```
+   Validates specs, checks permissions, and logs `WOULD_SUBMIT` without dispatching agents or mutating repositories.
+2. **Live Execution Mode**:
+   ```bash
+   python -m orchestrator.bridge_cli watch --live
+   ```
+
+---
+
+## 7. Operator Companion Inbox Dashboard
+
+The Task Server exposes a local web-based Companion Inbox for real-time review, interactive question answering, and evidence inspection:
+
+- **URL**: `http://127.0.0.1:8383/inbox`
+- **Features**:
+  - **Pending Proposals**: Inspect goal, repository, constraints, and test commands before authorizing.
+  - **One-Click Secure Approval**: Signs an HMAC-SHA256 token with single-use nonce directly from the local browser.
+  - **Agent Questions**: Review and answer in-flight agent questions (`WAITING_FOR_USER`) with cryptographic task binding.
+  - **Real-Time Outbox Timeline**: Inspect monotonic events (`task.started`, `planner.completed`, `implementation.completed`, `review.completed`, `verification.passed`, `task.done`).
+  - **Verification Evidence**: Read immutable candidate commit SHA, merged commit SHA, reviewer verdicts, and test execution outputs.
+
+Start the Task Server:
+```bash
+python -m orchestrator.bridge_cli serve --host 127.0.0.1 --port 8383
+```
+
+---
+
+## 8. Safety Boundaries & Security Model Clarifications
+
+> [!IMPORTANT]
+> **Worktrees Provide Git Branch Isolation, Not OS Filesystem Sandboxing**
+> Git worktrees (`.worktrees/seat-...`) isolate working trees and prevent git branch conflicts across parallel seats. They do **not** enforce operating system filesystem permission barriers. Agent execution isolation relies on runner permission flags (`--approve-for-me`, workspace scoping).
+
+> [!NOTE]
+> **Network Policy Clarification**
+> The constraint `"No network calls"` in task specifications applies strictly to **generated application code and deterministic verification test suites**. Outgoing API calls from agent seat runners to model providers (OpenAI, Anthropic, Google) are permitted and necessary for agent operation.
+
+> [!NOTE]
+> **Goldfish Transcripts Read-Only Invariant**
+> Boss Rig treats Goldfish Desktop transcripts (`*.json`) as **read-only source feeds**. Boss Rig never writes back to Goldfish's private files or attempts to mutate its SQLite database. Bidirectional operator communication is delivered via desktop notifications, the CLI, and the local Companion Inbox UI.
+

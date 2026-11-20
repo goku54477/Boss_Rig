@@ -60,17 +60,31 @@ set_state() {
   printf 'GATE_EVENT task=%s state=%s\n' "$task" "$state"
 }
 
-# Normalize .git file in worktree to relative gitdir path
+# Normalize .git file in worktree and .git/worktrees/<seat>/gitdir to relative paths
 # Ensures cross-platform compatibility between Windows and WSL2 Git
 normalize_worktree_gitdir() {
   local wt="$1"
   local seat="$2"
   if [[ -f "$wt/.git" ]]; then
+    rm -f "$wt/.git"
     printf 'gitdir: ../../.git/worktrees/%s\n' "$seat" > "$wt/.git"
+  fi
+  if [[ -f "$COMMON_GIT_DIR/worktrees/$seat/gitdir" ]]; then
+    printf '../../../.worktrees/%s/.git\n' "$seat" > "$COMMON_GIT_DIR/worktrees/$seat/gitdir"
   fi
 }
 
+normalize_all_worktrees() {
+  local wt name
+  for wt in "$WORKTREE_ROOT"/*; do
+    [[ -d "$wt" ]] || continue
+    name="$(basename "$wt")"
+    normalize_worktree_gitdir "$wt" "$name"
+  done
+}
+
 branch_worktree() {
+  normalize_all_worktrees
   local wanted="refs/heads/$1"
   local wt=""
   local line

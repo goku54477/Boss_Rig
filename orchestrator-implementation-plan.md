@@ -1,7 +1,7 @@
 # Implementation Plan: All-Encompassing Multi-Agent Coding Orchestrator
 
 ## Goal Description
-Build an all-encompassing, production-grade multi-agent coding orchestration system based on the architectural findings in [deep-research-report.md](file:///c:/Users/jacob/Boss%20Agent/deep-research-report.md).
+Build an all-encompassing, production-grade multi-agent coding orchestration system based on the architectural findings in [deep-research-report.md](deep-research-report.md).
 
 The orchestrator operates on a four-tier architecture:
 1. **Control / Team Plane**: **OpenRig** (`@openrig/cli`) managing persistent agent seats, tmux sessions, SQLite coordination state (`$OPENRIG_HOME/openrig.sqlite`), and inter-agent communication (`rig send`, broadcast, chatrooms).
@@ -86,7 +86,7 @@ flowchart TD
 ## Open Questions
 
 > [!NOTE]
-> 1. **Target Project Repository**: Should we initialize the orchestrator and worktrees directly inside `c:\Users\jacob\Boss Agent`, or do you have an external git repository you want this orchestrator to manage? *(Default plan: initialize Git in `c:\Users\jacob\Boss Agent` and demonstrate the end-to-end multi-agent flow here first).*
+> 1. **Target Project Repository**: Should we initialize the orchestrator and worktrees directly inside `<REPO_ROOT>`, or do you have an external git repository you want this orchestrator to manage? *(Default plan: initialize Git in `<REPO_ROOT>` and demonstrate the end-to-end multi-agent flow here first).*
 > 2. **Goldfish Memory Query Mode**: For Goldfish MCP in Codex, should we set `default_tools_approval_mode = "prompt"` initially for manual review of memory fetches, or `"auto"` for frictionless unattended execution? *(Recommended: `"prompt"` during initial setup, then switch to `"auto"` for automated runs).*
 
 ---
@@ -165,7 +165,7 @@ Registers Goldfish Desktop MCP with Codex.
 #!/usr/bin/env bash
 set -euo pipefail
 
-GOLDFISH_PATH="/mnt/c/Users/jacob/AppData/Local/goldfish/bin/goldfish-mcp.exe"
+GOLDFISH_PATH="/mnt/c/Users/<YOUR_USER>/AppData/Local/goldfish/bin/goldfish-mcp.exe"
 if [[ ! -f "$GOLDFISH_PATH" ]]; then
   echo "Warning: Goldfish MCP binary not found at $GOLDFISH_PATH" >&2
 fi
@@ -241,8 +241,8 @@ DEFAULT_TIMEOUT="${OPENCODE_TASK_TIMEOUT_SEC:-1800}"
 # Determine opencode binary (native or Windows wrapper)
 OPENCODE_BIN="opencode"
 if ! command -v opencode >/dev/null 2>&1; then
-  if [[ -f "/mnt/c/Users/jacob/bin/opencode.cmd" ]]; then
-    OPENCODE_BIN="cmd.exe /c C:\\Users\\jacob\\bin\\opencode.cmd"
+  if [[ -f "/mnt/c/Users/<YOUR_USER>/bin/opencode.cmd" ]]; then
+    OPENCODE_BIN="cmd.exe /c C:\\Users\\<YOUR_USER>\\bin\\opencode.cmd"
   fi
 fi
 
@@ -416,8 +416,8 @@ class AgyProcess:
     @classmethod
     def start(cls) -> "AgyProcess":
         agy_cmd = "agy"
-        if not os.path.exists("/usr/bin/agy") and os.path.exists("/mnt/c/Users/jacob/AppData/Local/agy/bin/agy.exe"):
-            agy_cmd = "/mnt/c/Users/jacob/AppData/Local/agy/bin/agy.exe"
+        if not os.path.exists("/usr/bin/agy") and os.path.exists("/mnt/c/Users/<YOUR_USER>/AppData/Local/agy/bin/agy.exe"):
+            agy_cmd = "/mnt/c/Users/<YOUR_USER>/AppData/Local/agy/bin/agy.exe"
 
         args = [agy_cmd, "--input-format", "stream-json", "--output-format", "stream-json"]
         if os.environ.get("AGY_SANDBOX", "1") == "1":
@@ -576,7 +576,7 @@ Provides subcommands:
 - `status <task-id>`: Prints current task state (`QUEUED`, `ASSIGNED`, `ACTIVE`, `REVIEW`, `MERGE_READY`, `MERGING`, `DONE`).
 - `recover [--force]`: Clears stale lock files and aborts hanging merges.
 
-*(Implements the full script from lines 1716–2478 of [deep-research-report.md](file:///c:/Users/jacob/Boss%20Agent/deep-research-report.md#L1716-L2478))*.
+*(Implements the full script from lines 1716–2478 of [deep-research-report.md](deep-research-report.md#L1716-L2478))*.
 
 ---
 
