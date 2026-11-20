@@ -317,7 +317,11 @@ The specification block is formatted inside a fenced `boss-rig-spec` markdown co
 ````
 
 The canonical SHA-256 hash is computed deterministically:
-$$\text{spec\_id} = \text{sha256}(\text{canonical\_json}(\text{spec\_dict}))$$
+
+```math
+\text{spec\_id} = \text{sha256}(\text{canonical\_json}(\text{spec\_dict}))
+```
+
 *(using `sort_keys=True` and compact separators `(',', ':')`)*.
 
 #### Step 2: Explicit User Approval Command

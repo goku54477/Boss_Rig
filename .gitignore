@@ -32,15 +32,8 @@ goldfish.db
 chats/
 inbox.json
 
-# Local Shared Plane override and root soak/proof logs
+# Local Shared Plane override and seat logs
 plane.yaml
-agy_proof*.txt
-oc_proof*.txt
-concur_mod_*.py
-lock_*.txt
-success_*.txt
-feature_*.py
-soak_gate_proof.txt
 .openrig-opencode-seat.log
 docs/superpowers/
 
