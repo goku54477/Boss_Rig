@@ -67,7 +67,7 @@ class GoldfishChatListener(BaseListener):
         self,
         chats_dir: Optional[Path] = None,
         store: Optional[TaskStore] = None,
-        context_window: int = 3,
+        context_window: int = 6,
     ) -> None:
         self.chats_dir = chats_dir or resolve_goldfish_chats_dir()
         self.store = store or TaskStore()
@@ -187,7 +187,7 @@ class GoldfishChatListener(BaseListener):
                             continue
                         prev_text = _extract_text(prev.get("content", "")).strip()
                         if prev_text and not _contains_shared_plane_marker(prev_text):
-                            context.append(f"{prev.get('role', 'unknown')}: {prev_text[:280]}")
+                            context.append(f"{prev.get('role', 'unknown')}: {prev_text[:650]}")
 
                 raw_ts = msg.get("createdAt")
                 msg_ts_sec = _parse_timestamp(raw_ts, chat_fallback_ts)

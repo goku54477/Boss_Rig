@@ -617,7 +617,7 @@ class TaskService:
                     verification_commands=spec.verification_commands,
                 )
                 agents = spec.assigned_agents
-                planner = agents.get("planner", "antigravity-1")
+                planner = agents.get("planner")
                 implementer = agents.get("implementer", "opencode-1")
                 reviewer = agents.get("reviewer", "antigravity-1")
 
@@ -626,46 +626,47 @@ class TaskService:
                 if reviewer == implementer:
                     raise PolicyViolation("Reviewer cannot be implementer.")
 
-                # Turn 1: Planning
-                stage = "planner"
-                self.store.emit_outbox_event(
-                    task_id=task_id,
-                    event_type="planner.started",
-                    lifecycle_status="ACTIVE",
-                    role="planner",
-                    seat_id=planner,
-                    summary=f"Planner turn started by {planner}",
-                )
-                engine.assign_role(task_id, engine=planner, role="planner")
-                p_res = engine.execute_turn(
-                    task_id,
-                    engine=planner,
-                    role="planner",
-                    prompt=spec.goal,
-                    timeout_sec=spec.timeout_sec,
-                )
-                if p_res.get("status") != "SUCCESS":
-                    err_msg = str(p_res.get("error") or "Planning failed")
-                    self._record_stage_failure(
+                # Turn 1: Planning (optional; skipped when no planner is assigned)
+                if planner:
+                    stage = "planner"
+                    self.store.emit_outbox_event(
                         task_id=task_id,
-                        spec_hash=spec_hash,
-                        stage="planner",
-                        fail_state=TaskState.FAILED.value,
-                        event_type="planner.failed",
-                        summary=f"Planning turn failed on {planner}: {err_msg}",
-                        error_msg=err_msg,
+                        event_type="planner.started",
+                        lifecycle_status="ACTIVE",
                         role="planner",
                         seat_id=planner,
+                        summary=f"Planner turn started by {planner}",
                     )
-                    return
-                self.store.emit_outbox_event(
-                    task_id=task_id,
-                    event_type="planner.completed",
-                    lifecycle_status="ACTIVE",
-                    role="planner",
-                    seat_id=planner,
-                    summary=f"Planner turn completed by {planner}",
-                )
+                    engine.assign_role(task_id, engine=planner, role="planner")
+                    p_res = engine.execute_turn(
+                        task_id,
+                        engine=planner,
+                        role="planner",
+                        prompt=spec.goal,
+                        timeout_sec=spec.timeout_sec,
+                    )
+                    if p_res.get("status") != "SUCCESS":
+                        err_msg = str(p_res.get("error") or "Planning failed")
+                        self._record_stage_failure(
+                            task_id=task_id,
+                            spec_hash=spec_hash,
+                            stage="planner",
+                            fail_state=TaskState.FAILED.value,
+                            event_type="planner.failed",
+                            summary=f"Planning turn failed on {planner}: {err_msg}",
+                            error_msg=err_msg,
+                            role="planner",
+                            seat_id=planner,
+                        )
+                        return
+                    self.store.emit_outbox_event(
+                        task_id=task_id,
+                        event_type="planner.completed",
+                        lifecycle_status="ACTIVE",
+                        role="planner",
+                        seat_id=planner,
+                        summary=f"Planner turn completed by {planner}",
+                    )
 
                 # Turn 2: Implementing
                 stage = "implementer"

@@ -54,6 +54,7 @@ class BuildReport:
     test_summary: str = ""
     review_summary: str = ""
     failed_stage: Optional[str] = None
+    integration_worktree: Optional[str] = None
     created_at: float = field(default_factory=time.time)
 
     def to_markdown(self) -> str:
@@ -71,9 +72,11 @@ class BuildReport:
         ]
         if self.failed_stage:
             lines.append(f"- **Failed Stage:** `{self.failed_stage}`")
+        lines.append(f"- **Repo:** `{self.repo}`")
+        if self.integration_worktree:
+            lines.append(f"- **Integration Worktree:** `{self.integration_worktree}`")
         lines.extend(
             [
-                f"- **Repo:** `{self.repo}`",
                 f"- **Goal:** {self.goal}",
                 f"- **Candidate Commit:** `{self.candidate_commit or 'none'}`",
                 f"- **Merge Commit:** `{self.merge_commit or 'none'}`",

@@ -27,7 +27,7 @@ from plane.adapters.speaker import (
     ToastNotificationSpeaker,
 )
 from plane.config import PlaneConfig, _fallback_parse_yaml
-from plane.daemon import SharedPlaneDaemon, SpecBuilder, run_doctor
+from plane.daemon import SharedPlaneDaemon, SpecBuilder, _git_changed_files, main as daemon_main, run_doctor
 from plane.router import HeuristicRouter, LayaRouter, create_router
 from plane.schemas import BuildReport, PlaneMessage, RoutingDecision
 
@@ -1444,6 +1444,229 @@ class TestLiveSessionRegressions(unittest.TestCase):
                 msg, decision
             )
             self.assertEqual(spec_custom.verification_commands, ["pytest -q"])
+
+    def test_cli_auto_approve_sandbox_flag_and_non_sandbox_guardrail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sandbox_repo = tmp_path / ".disposable-live-repo"
+            other_repo = tmp_path / "prod_repo"
+            _init_git_repo(sandbox_repo)
+            _init_git_repo(other_repo)
+
+            # 1. CLI flag --auto-approve-sandbox flips dispatch_mode only when passed
+            captured_cfgs = []
+
+            class _FakeDaemon:
+                def baseline(self):
+                    return {}
+
+                def step_once(self):
+                    return []
+
+            def fake_build(cfg, dry_run=True):
+                captured_cfgs.append((cfg.dispatch_mode, dry_run))
+                return _FakeDaemon()
+
+            with patch("plane.daemon.PlaneConfig.load", return_value=PlaneConfig()), patch(
+                "plane.daemon.build_daemon_from_config", side_effect=fake_build
+            ):
+                daemon_main(["up", "--live", "--once"])
+                daemon_main(["up", "--live", "--auto-approve-sandbox", "--once"])
+
+            self.assertEqual(captured_cfgs[0], ("propose_first", False))
+            self.assertEqual(captured_cfgs[1], ("auto_dispatch_sandbox", False))
+
+            # 2. Proposal-then-approve flow: sandbox auto-approves; non-sandbox stays PENDING_APPROVAL
+            chats_dir = tmp_path / "chats"
+            chats_dir.mkdir()
+            store = TaskStore(db_path=tmp_path / "tasks.sqlite")
+            emitter = EventEmitter(log_path=tmp_path / "events.jsonl", enable_notifications=False)
+            eng = FakeDaemonEngine()
+            svc = TaskService(
+                store=store,
+                event_emitter=emitter,
+                engine_factory=lambda: eng,
+                extra_allowed_repos=[sandbox_repo, other_repo],
+                dry_run=False,
+            )
+            cfg = PlaneConfig(
+                dispatch_mode="auto_dispatch_sandbox",
+                default_repo=str(sandbox_repo),
+                sandbox_repos=[str(sandbox_repo)],
+                reports_dir=str(tmp_path / "reports"),
+            )
+            fake_laya = FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"noul": 0.94},
+                        "action": {"choice": "PROPOSE_BUILD"},
+                        "target_agent": {"choice": "codex-1"},
+                    }
+                }
+            )
+            daemon = SharedPlaneDaemon(
+                config=cfg,
+                service=svc,
+                listeners=[GoldfishChatListener(chats_dir=chats_dir, store=store)],
+                router=LayaRouter(threshold=0.75, backend=fake_laya),
+                speaker=ReportFileSpeaker(reports_dir=tmp_path / "reports"),
+                dry_run=False,
+            )
+            daemon.baseline()
+
+            (chats_dir / "chat1.json").write_text(
+                json.dumps(
+                    {
+                        "id": "chat1",
+                        "messages": [
+                            {"id": "m-sb", "role": "user", "content": "Build an alarm app using codex"},
+                            {
+                                "id": "m-prod",
+                                "role": "user",
+                                "content": f"Build a billing fix in repo={other_repo} using codex",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            actions = daemon.step_once()
+            svc.wait_all(timeout_sec=5.0)
+            by_id = {a["message_id"]: a for a in actions if "message_id" in a}
+            self.assertEqual(by_id["m-sb"]["status"], "AUTO_DISPATCHED")
+            self.assertEqual(by_id["m-prod"]["status"], "PROPOSED")
+            proposals = {p["message_id"]: p for p in svc.list_proposals()}
+            self.assertEqual(proposals["m-sb"]["status"], "APPROVED")
+            self.assertEqual(proposals["m-prod"]["status"], "PENDING_APPROVAL")
+
+    def test_git_changed_files_handles_two_parent_merge_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            _init_git_repo(repo_dir)
+            subprocess.run(["git", "checkout", "-b", "task/T-MERGE"], cwd=repo_dir, check=True, capture_output=True)
+            for fname in ("index.html", "app.js", "styles.css"):
+                (repo_dir / fname).write_text(f"// {fname}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "feat: add app"], cwd=repo_dir, check=True, capture_output=True)
+
+            subprocess.run(["git", "checkout", "integration"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "merge", "--no-ff", "task/T-MERGE", "-m", "Merge task/T-MERGE"],
+                cwd=repo_dir,
+                check=True,
+                capture_output=True,
+            )
+            merge_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
+            ).strip()
+            changed = _git_changed_files(str(repo_dir), merge_sha)
+            self.assertEqual(sorted(changed), ["app.js", "index.html", "styles.css"])
+
+    def test_codex_uses_antigravity_reviewer_skips_planner_and_six_turn_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sandbox_repo = tmp_path / ".disposable-live-repo"
+            _init_git_repo(sandbox_repo)
+            chats_dir = tmp_path / "chats"
+            chats_dir.mkdir()
+            store = TaskStore(db_path=tmp_path / "tasks.sqlite")
+            listener = GoldfishChatListener(chats_dir=chats_dir, store=store)
+            listener.baseline()
+
+            msgs = []
+            for i in range(1, 8):
+                msgs.append(
+                    {
+                        "id": f"ctx-{i}",
+                        "role": "user" if i % 2 else "assistant",
+                        "content": f"Turn {i}: " + ("x" * 350),
+                    }
+                )
+            msgs.append({"id": "build-now", "role": "user", "content": "Build this app using codex"})
+            (chats_dir / "c6.json").write_text(json.dumps({"id": "c6", "messages": msgs}), encoding="utf-8")
+
+            emitted = listener.poll()
+            self.assertGreaterEqual(len(emitted), 1)
+            msg = emitted[-1]
+            self.assertEqual(msg.id, "build-now")
+            self.assertEqual(len(msg.recent_context), 6)
+            self.assertNotIn("Turn 1:", "\n".join(msg.recent_context))
+            self.assertIn("Turn 2:", msg.recent_context[0])
+            self.assertIn("Turn 7:", msg.recent_context[-1])
+            self.assertGreater(len(msg.recent_context[0]), 280)
+
+            fake_laya = FakeLayaBackend(
+                {
+                    "answers": {
+                        "is_build_task": {"noul": 0.95},
+                        "action": {"choice": "PROPOSE_BUILD"},
+                        "target_agent": {"choice": "codex-1"},
+                    }
+                }
+            )
+            router = LayaRouter(threshold=0.75, backend=fake_laya)
+            decision = router.classify(msg)
+            self.assertEqual(fake_laya.last_call[0], {"message": "Build this app using codex"})
+
+            cfg = PlaneConfig(
+                default_repo=str(sandbox_repo),
+                sandbox_repos=[str(sandbox_repo)],
+                enabled_agents=["opencode-1", "codex-1", "antigravity-1"],
+            )
+            spec = SpecBuilder(config=cfg, extra_allowed_repos=[sandbox_repo]).build(msg, decision)
+            self.assertEqual(
+                spec.assigned_agents,
+                {"implementer": "codex-1", "reviewer": "antigravity-1"},
+            )
+            self.assertIn("Turn 2:", spec.goal)
+            self.assertIn("Turn 7:", spec.goal)
+
+            # Submitting spec skips redundant planner turn and runs only implementer -> reviewer
+            from orchestrator.engine import OrchestrationEngine
+            from orchestrator.server import get_or_create_auth_token
+
+            emitter = EventEmitter(log_path=tmp_path / "events.jsonl", enable_notifications=False)
+            svc = TaskService(
+                store=store,
+                event_emitter=emitter,
+                extra_allowed_repos=[sandbox_repo],
+                dry_run=False,
+            )
+            turns = []
+
+            def fake_turn(self_eng, task_id, engine, role, prompt=None, timeout_sec=60, **kwargs):
+                turns.append((role, engine))
+                return {"status": "SUCCESS"}
+
+            spec_hash = spec.compute_hash()
+            tok = create_approval_token(
+                spec_id=spec_hash,
+                repo=str(sandbox_repo),
+                conversation_id="c6",
+                message_id="build-now",
+                secret_key=get_or_create_auth_token(),
+                nonce="n-skip-plan",
+            )
+            with patch.object(OrchestrationEngine, "execute_turn", fake_turn), patch.object(
+                OrchestrationEngine, "run_deterministic_verification", return_value=True
+            ):
+                svc.task_submit(
+                    spec=spec,
+                    idempotency_key="skip-plan-1",
+                    approved=True,
+                    approved_hash=spec_hash,
+                    approval_record={
+                        "spec_id": spec_hash,
+                        "repo": str(sandbox_repo),
+                        "source": "local_web",
+                        "conversation_id": "c6",
+                        "message_id": "build-now",
+                        "approval_token": tok,
+                        "nonce": "n-skip-plan",
+                    },
+                )
+                svc.wait_all(timeout_sec=5.0)
+            self.assertEqual(turns, [("implementer", "codex-1"), ("reviewer", "antigravity-1")])
 
 
 if __name__ == "__main__":

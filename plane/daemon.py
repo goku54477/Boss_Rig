@@ -72,13 +72,27 @@ def _git_changed_files(repo: str, commit_sha: Optional[str]) -> List[str]:
         return []
     try:
         out = subprocess.check_output(
-            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit_sha],
+            [
+                "git",
+                "diff-tree",
+                "-m",
+                "--first-parent",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                commit_sha,
+            ],
             cwd=repo_path,
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=5,
         )
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        seen: List[str] = []
+        for line in out.splitlines():
+            clean = line.strip()
+            if clean and clean not in seen:
+                seen.append(clean)
+        return seen
     except Exception:
         return []
 
@@ -124,18 +138,37 @@ class SpecBuilder:
                 else enabled[0]
             )
         )
-        planner = (
-            self.config.default_planner
-            if self.config.default_planner in enabled
-            else enabled[0]
-        )
-        if planner == implementer and len(enabled) >= 2:
-            planner = next(a for a in enabled if a != implementer)
-        reviewer = PolicyEngine.select_reviewer(
-            implementer=implementer,
-            available_engines=enabled,
-            planner=planner,
-        )
+        if implementer == "codex-1":
+            reviewer = (
+                "antigravity-1"
+                if "antigravity-1" in enabled
+                else PolicyEngine.select_reviewer(
+                    implementer=implementer,
+                    available_engines=enabled,
+                )
+            )
+            assigned_agents: Dict[str, str] = {
+                "implementer": implementer,
+                "reviewer": reviewer,
+            }
+        else:
+            planner = (
+                self.config.default_planner
+                if self.config.default_planner in enabled
+                else enabled[0]
+            )
+            if planner == implementer and len(enabled) >= 2:
+                planner = next(a for a in enabled if a != implementer)
+            reviewer = PolicyEngine.select_reviewer(
+                implementer=implementer,
+                available_engines=enabled,
+                planner=planner,
+            )
+            assigned_agents = {
+                "planner": planner,
+                "implementer": implementer,
+                "reviewer": reviewer,
+            }
 
         goal = _clean_goal_text(msg.text)
         clean_ctx = [
@@ -144,8 +177,8 @@ class SpecBuilder:
             if turn and "[SHARED PLANE" not in turn
         ]
         if clean_ctx:
-            ctx_block = "\n".join(f"- {turn}" for turn in clean_ctx[-3:])
-            goal = f"{goal}\n\nRecent Goldfish context:\n{ctx_block}"[:1500]
+            ctx_block = "\n".join(f"- {turn}" for turn in clean_ctx[-6:])
+            goal = f"{goal}\n\nRecent Goldfish context:\n{ctx_block}"[:4000]
 
         return TaskSpec(
             repo=str(resolved_repo),
@@ -157,11 +190,7 @@ class SpecBuilder:
             ],
             acceptance_criteria=["All verification commands pass cleanly"],
             allowed_merge_target=merge_target,
-            assigned_agents={
-                "planner": planner,
-                "implementer": implementer,
-                "reviewer": reviewer,
-            },
+            assigned_agents=assigned_agents,
         )
 
 
@@ -282,6 +311,12 @@ class SharedPlaneDaemon:
                 "error": str(exc),
             }
 
+        prop = self.service.propose_task(
+            spec=spec,
+            source=f"shared_plane:{msg.source}",
+            conversation_id=msg.conversation_id,
+            message_id=msg.id,
+        )
         if self._is_sandbox_auto_dispatch_eligible(spec):
             spec_hash = spec.compute_hash()
             nonce = secrets.token_hex(16)
@@ -308,11 +343,14 @@ class SharedPlaneDaemon:
             )
             submit_res = self.service.task_submit(
                 spec=spec,
-                idempotency_key=f"plane-{msg.source}-{msg.id}",
+                idempotency_key=f"prop-{prop['proposal_id']}",
                 approved=True,
                 approved_hash=spec_hash,
                 conversation_id=msg.conversation_id,
                 approval_record=approval,
+            )
+            self.service.store.update_proposal_status(
+                prop["proposal_id"], status="APPROVED", approval_token=token
             )
             task_id = submit_res.get("task_id")
             self.service.store.update_processed_event(
@@ -322,16 +360,11 @@ class SharedPlaneDaemon:
                 "action": "PROPOSE_BUILD",
                 "message_id": msg.id,
                 "status": "AUTO_DISPATCHED",
+                "proposal_id": prop["proposal_id"],
                 "task_id": task_id,
                 "target_agent": spec.assigned_agents.get("implementer"),
             }
 
-        prop = self.service.propose_task(
-            spec=spec,
-            source=f"shared_plane:{msg.source}",
-            conversation_id=msg.conversation_id,
-            message_id=msg.id,
-        )
         self.service.store.update_processed_event(
             msg.id,
             status="PROPOSED",
@@ -374,11 +407,17 @@ class SharedPlaneDaemon:
 
             res = self.service.task_result(task_id)
             commit_ref = res.get("merge_commit") or res.get("candidate_commit")
-            files_changed = _git_changed_files(res.get("repo", ""), commit_ref)
+            repo_str = res.get("repo", "")
+            files_changed = _git_changed_files(repo_str, commit_ref)
+            int_wt_str: Optional[str] = None
+            if res.get("merge_commit") and repo_str:
+                int_wt = Path(repo_str) / ".worktrees" / "_integration"
+                if int_wt.exists():
+                    int_wt_str = str(int_wt)
             report = BuildReport(
                 task_id=task_id,
                 status=state,
-                repo=res.get("repo", ""),
+                repo=repo_str,
                 goal=res.get("goal", ""),
                 candidate_commit=res.get("candidate_commit"),
                 merge_commit=res.get("merge_commit"),
@@ -388,6 +427,7 @@ class SharedPlaneDaemon:
                 ),
                 review_summary=_format_evidence_summary(res.get("review_findings"), "n/a"),
                 failed_stage=res.get("failed_stage"),
+                integration_worktree=int_wt_str,
             )
             speak_res = self.speaker.speak(report)
             emitted.append(
@@ -670,6 +710,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_up = sub.add_parser("up", help="Start Shared Plane Listener/Router/Speaker daemon")
     p_up.add_argument("--config", type=Path, default=None, help="Path to plane.yaml")
     p_up.add_argument("--live", action="store_true", help="Enable live dispatch (defaults to dry-run)")
+    p_up.add_argument(
+        "--auto-approve-sandbox",
+        action="store_true",
+        help="Opt-in: auto-approve and dispatch proposals targeting .disposable-live-repo on integration",
+    )
     p_up.add_argument("--once", action="store_true", help="Baseline and run a single poll tick")
 
     args = parser.parse_args(argv)
@@ -684,6 +729,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "up":
+        if getattr(args, "auto_approve_sandbox", False):
+            config.dispatch_mode = "auto_dispatch_sandbox"
         daemon = build_daemon_from_config(config, dry_run=not args.live)
         if args.once:
             daemon.baseline()
